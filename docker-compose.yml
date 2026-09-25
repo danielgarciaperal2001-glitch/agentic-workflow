@@ -1,0 +1,81 @@
+# =============================================================================
+# Local development stack: PostgreSQL (durable checkpointer + run registry)
+# and the API control plane.
+#
+#   docker compose up -d --build
+#   docker compose ps
+#   docker compose down -v
+# =============================================================================
+name: agentic-workflow
+
+x-postgres-env: &postgres-env
+  POSTGRES_USER: ${AWF_POSTGRES_USER:-agentic}
+  POSTGRES_PASSWORD: ${AWF_POSTGRES_PASSWORD:-agentic}
+  POSTGRES_DB: ${AWF_POSTGRES_DB:-agentic}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agentic-postgres
+    restart: unless-stopped
+    environment:
+      <<: *postgres-env
+      # Deterministic collation keeps ORDER BY stable across host platforms.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "work_mem=16MB"
+      - "-c"
+      - "log_min_duration_statement=500"
+    ports:
+      - "${AWF_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AWF_POSTGRES_USER:-agentic} -d ${AWF_POSTGRES_DB:-agentic}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      target: runtime
+    container_name: agentic-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AWF_ENVIRONMENT: development
+      AWF_LOG_FORMAT: json
+      AWF_POSTGRES_ENABLED: "true"
+      AWF_POSTGRES_DSN: >-
+        postgresql://${AWF_POSTGRES_USER:-agentic}:${AWF_POSTGRES_PASSWORD:-agentic}@postgres:5432/${AWF_POSTGRES_DB:-agentic}
+      AWF_LLM_PROVIDER: ${AWF_LLM_PROVIDER:-echo}
+      AWF_LLM_API_KEY: ${AWF_LLM_API_KEY:-}
+      AWF_LLM_MODEL: ${AWF_LLM_MODEL:-gpt-4o-mini}
+      AWF_API_EMBEDDED_WORKER: "true"
+    ports:
+      - "${AWF_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    develop:
+      watch:
+        - path: ./src
+          action: sync
+          target: /app/src
+
+volumes:
+  postgres-data:
+    name: agentic-postgres-data

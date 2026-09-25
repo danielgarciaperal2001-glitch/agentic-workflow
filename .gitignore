@@ -1,0 +1,93 @@
+# --------------------------------------------------------------------------- #
+# Python
+# --------------------------------------------------------------------------- #
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib60/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# --------------------------------------------------------------------------- #
+# Testing & coverage
+# --------------------------------------------------------------------------- #
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit.xml
+.tox/
+.nox/
+.hypothesis/
+
+# --------------------------------------------------------------------------- #
+# Type checkers / linters
+# --------------------------------------------------------------------------- #
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pytype/
+.pyre/
+
+# --------------------------------------------------------------------------- #
+# Secrets & local configuration
+# --------------------------------------------------------------------------- #
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# --------------------------------------------------------------------------- #
+# Runtime artefacts
+# --------------------------------------------------------------------------- #
+*.log
+logs/
+*.pid
+*.sqlite3
+*.db
+tmp/
+.cache/
+.langgraph_api/
+
+# Evaluation artefacts (datasets are committed, results are not)
+eval_results/
+reports/
+artifacts/
+*.eval.json
+
+# --------------------------------------------------------------------------- #
+# Editors & OS
+# --------------------------------------------------------------------------- #
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

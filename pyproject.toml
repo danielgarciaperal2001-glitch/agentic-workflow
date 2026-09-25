@@ -1,0 +1,233 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentic-workflow"
+version = "0.1.0"
+description = "Multi-Agent AI Workflow Engine with Human-in-the-Loop, built on LangGraph with PostgreSQL persistence, time-travel replay and automated RAG evaluation."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "danielgarciaperal2001-glitch", email = "dabielgarcigeral2001@gmail.com" }]
+keywords = [
+  "ai",
+  "agents",
+  "agentic-workflow",
+  "langgraph",
+  "human-in-the-loop",
+  "orchestration",
+  "llm",
+  "ragas",
+  "deepeval",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: LangGraph",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+  "Typing :: Typed",
+]
+
+# Runtime dependencies are intentionally lean. The orchestration core only needs
+# LangGraph + a small amount of plumbing; everything else (evals, observability,
+# optional LLM providers) lives behind extras so production images stay small.
+dependencies = [
+  "langgraph>=1.0,<2.0",
+  "langgraph-checkpoint>=4.0,<5.0",
+  "pydantic>=2.7,<3.0",
+  "pydantic-settings>=2.3,<3.0",
+  "structlog>=24.1",
+  "tenacity>=9.0",
+  "typing-extensions>=4.12",
+]
+
+[project.optional-dependencies]
+# Durable state: PostgreSQL checkpointer + run/audit persistence.
+postgres = [
+  "langgraph-checkpoint-postgres>=3.0,<5.0",
+  "psycopg[binary,pool]>=3.1",
+  "sqlalchemy>=2.0",
+  "alembic>=1.13",
+]
+# HTTP + realtime transport for the control plane.
+api = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "httpx>=0.27",
+]
+# Any OpenAI-compatible endpoint (OpenAI, Azure, vLLM, Ollama, LiteLLM, ...).
+llm = [
+  "langchain-openai>=0.3",
+  "openai>=1.40",
+]
+# Offline / CI friendly LLM that needs no credentials.
+llm-local = [
+  "ollama>=0.4",
+]
+# Automated evaluation suites.
+eval = [
+  "ragas>=0.2",
+  "datasets>=3.0",
+]
+eval-deepeval = [
+  "deepeval>=2.2",
+]
+# Observability, metrics and tracing.
+obs = [
+  "langsmith>=0.2",
+  "prometheus-client>=0.20",
+  "opentelemetry-api>=1.25",
+  "opentelemetry-instrumentation-fastapi>=0.46b0",
+  "opentelemetry-instrumentation-httpx>=0.46b0",
+]
+# Developer experience.
+dev = [
+  "pytest>=8.2",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=5.0",
+  "pytest-timeout>=2.3",
+  "mypy>=1.11",
+  "ruff>=0.6",
+  "types-psycopg[binary]>=3.1",
+]
+all = [
+  "agentic-workflow[postgres,api,llm,eval,obs,dev]",
+]
+
+[project.urls]
+Homepage = "https://github.com/danielgarciaperal2001-glitch/agentic-workflow"
+Repository = "https://github.com/danielgarciaperal2001-glitch/agentic-workflow"
+Issues = "https://github.com/danielgarciaperal2001-glitch/agentic-workflow/issues"
+Documentation = "https://github.com/danielgarciaperal2001-glitch/agentic-workflow/tree/main/docs"
+
+[project.scripts]
+agentic-workflow = "agentic_workflow.cli:main"
+awf = "agentic_workflow.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentic_workflow"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "docs", "README.md", "LICENSE"]
+
+# --------------------------------------------------------------------------- #
+# Tooling configuration
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+extend-exclude = [".venv", "docs", "build", "dist"]
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle
+  "W",    # pycodestyle warnings
+  "F",    # pyflakes
+  "I",    # isort
+  "N",    # pep8-naming
+  "UP",   # pyupgrade
+  "B",    # flake8-bugbear
+  "A",    # flake8-builtins
+  "C4",   # flake8-comprehensions
+  "DTZ",  # naive datetimes
+  "T10",  # debugger imports
+  "EM",   # exception messages
+  "ISC",  # implicit string concat
+  "ICN",  # import conventions
+  "G",    # logging format
+  "PIE",  # misc lints
+  "RUF",  # ruff specific
+  "S",    # bandit security
+  "SIM",  # simplify
+  "PD",   # pandas-vet
+  "PTH",  # pathlib
+  "TID",  # tidy imports
+  "ARG",  # unused arguments
+]
+ignore = [
+  "E501",    # line length handled by the formatter
+  "D203",    # incompatible with D211
+  "D213",    # incompatible with D212
+  "ISC001",  # conflicts with the formatter
+  "RUF012",  # mutable class attrs are fine in pydantic models
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "ARG001", "ARG002", "PLC0415"]
+"examples/**" = ["T201", "INP001"]
+"src/agentic_workflow/cli.py" = ["T201"]
+"src/agentic_workflow/evals/**" = ["S311", "S101"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agentic_workflow"]
+combine-as-imports = true
+force-sort-within-sections = true
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.format]
+docstring-code-format = true
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+strict = true
+warn_unreachable = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["langgraph.*", "langchain_core.*", "ragas.*", "deepeval.*", "psycopg.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = [
+  "-ra",
+  "--strict-markers",
+  "--strict-config",
+  "--timeout=120",
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+  "unit: Fast, dependency-free tests of pure logic.",
+  "integration: Tests that wire multiple components together.",
+  "postgres: Requires a live PostgreSQL instance (skipped when unavailable).",
+  "api: Tests exercising the HTTP/WebSocket control plane.",
+  "eval: Automated LLM-quality evaluation tests (Ragas/DeepEval).",
+  "slow: Long running tests, deselect with '-m \"not slow\"'.",
+]
+filterwarnings = [
+  "error",
+  "ignore::DeprecationWarning:langchain_core.*",
+  "ignore::DeprecationWarning:langgraph.*",
+  "ignore::DeprecationWarning:websockets.*",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["src/agentic_workflow"]
+omit = ["*/evals/datasets/*", "*/cli.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "@abstractmethod",
+]
