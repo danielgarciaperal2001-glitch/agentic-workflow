@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 from agentic_workflow.human.gates import (
+    approval_id_for,
+    assert_not_already_resolved,
     build_approval_request,
     decode_interrupt,
     diff_preview,
@@ -27,13 +29,23 @@ from agentic_workflow.human.policy import (
     allowed_decisions,
     summarise_review,
 )
+from agentic_workflow.human.service import (
+    ApprovalService,
+    ApprovalView,
+    ResolutionResult,
+)
 
 __all__ = [
+    "ApprovalService",
+    "ApprovalView",
     "EscalationPolicy",
     "EscalationReason",
     "GateDecision",
+    "ResolutionResult",
     "Stage",
     "allowed_decisions",
+    "approval_id_for",
+    "assert_not_already_resolved",
     "build_approval_request",
     "decode_interrupt",
     "diff_preview",

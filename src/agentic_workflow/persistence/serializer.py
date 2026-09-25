@@ -28,28 +28,41 @@ from agentic_workflow.logging import get_logger
 
 log = get_logger(__name__)
 
-#: Domain types persisted in the graph state. Adding a model to
-#: :mod:`agentic_workflow.domain.schemas` means adding it here.
+#: Explicit allowlist. Empty means "discover from the domain module", which is the
+#: normal path; a deployment can pin the exact tuple to make the set reviewable
+#: and auditable in a security review.
 _ALLOWED_TYPES: tuple[type, ...] = ()
 
 
 def _collect_allowed_types() -> tuple[type, ...]:
-    """Enumerate the pydantic models that may appear in the state.
+    """Enumerate every type that may appear in the state.
+
+    Models are not enough. A ``ReviewResult`` contains ``Finding`` objects whose
+    ``severity`` is a ``Severity`` enum, and msgpack serialises that as a bare
+    string tagged with its enum class. Deserialising it needs the *enum* in the
+    allowlist too — leave it out and LangGraph blocks the value, logs
+    "Blocked deserialization", and hands the node a plain string where it
+    expected a ``Severity``. That is exactly the silent degradation this module
+    exists to prevent, so enums are collected alongside the models.
 
     Returns:
-        A tuple of model classes discovered from the domain module. Discovery is
-        automatic so a newly added schema is covered without touching this file
-        (and :mod:`tests.unit.test_persistence` asserts the round-trip).
+        A tuple of types discovered from the domain module. Discovery is automatic
+        so a newly added schema is covered without touching this file (and
+        :mod:`tests.unit.test_persistence` asserts the round-trip).
     """
+    from enum import Enum
+
     from pydantic import BaseModel
 
     from agentic_workflow.domain import schemas
 
-    return tuple(
-        obj
-        for obj in vars(schemas).values()
-        if isinstance(obj, type) and issubclass(obj, BaseModel)
-    )
+    found: list[type] = []
+    for obj in vars(schemas).values():
+        if not isinstance(obj, type):
+            continue
+        if issubclass(obj, (BaseModel, Enum)):
+            found.append(obj)
+    return tuple(found)
 
 
 def allowed_types() -> tuple[type, ...]:
