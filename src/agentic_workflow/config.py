@@ -236,7 +236,9 @@ class Settings(BaseSettings):
     postgres_sslmode: str = Field(default="prefer", min_length=1)
 
     # ---------------------------------------------------------------- api #
-    api_host: str = Field(default="0.0.0.0", min_length=1)
+    # Binding to every interface is the correct default for a container: the
+    # service is not reachable from outside the compose network otherwise.
+    api_host: str = Field(default="0.0.0.0", min_length=1)  # noqa: S104
     api_port: int = Field(default=8000, ge=1, le=65535)
     api_root_path: str = Field(
         default="",
@@ -342,7 +344,10 @@ class Settings(BaseSettings):
         if self.is_production and self.api_docs_enabled:
             # Documentation is a reconnaissance surface; keep it off by default.
             object.__setattr__(self, "api_docs_enabled", False)
-        if self.eval_provider is EvalProvider.DEEPEVAL and self.environment is Environment.PRODUCTION:
+        if (
+            self.eval_provider is EvalProvider.DEEPEVAL
+            and self.environment is Environment.PRODUCTION
+        ):
             raise ValueError("eval_provider='deepeval' is not permitted in production")
         return self
 
@@ -438,14 +443,12 @@ def load_settings(**overrides: Any) -> Settings:
         >>> s = load_settings(awf_environment="production")
         >>> s.is_production
         True
-        """
+    """
     try:
         return Settings(**overrides) if overrides else Settings()
-    except Exception as exc:  # noqa: BLE001 - re-raised with domain type
-        raise ConfigurationError(
-            f"invalid configuration: {exc}",
-            **({"cause": type(exc).__name__} if overrides else {}),
-        ) from exc
+    except Exception as exc:
+        context: dict[str, Any] = {"cause": type(exc).__name__} if overrides else {}
+        raise ConfigurationError(f"invalid configuration: {exc}", **context) from exc
 
 
 def reset_settings_cache() -> None:

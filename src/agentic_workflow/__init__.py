@@ -20,8 +20,8 @@ Example
 >>> import asyncio
 >>> from agentic_workflow import build_graph, create_run_config
 >>> from agentic_workflow.domain import ReviewRequest
->>> graph = build_graph()                      # doctest: +SKIP
->>> result = await graph.ainvoke(              # doctest: +SKIP
+>>> graph = build_graph()  # doctest: +SKIP
+>>> result = await graph.ainvoke(  # doctest: +SKIP
 ...     ReviewRequest(title="Add rate limiting"), create_run_config("t1")
 ... )
 """
@@ -36,13 +36,13 @@ except metadata.PackageNotFoundError:  # pragma: no cover - source checkout
     __version__ = "0.1.0"
 
 __all__ = [
+    "WorkflowEngine",
     "__version__",
     "build_graph",
     "create_run_config",
     "load_settings",
     "reset_settings_cache",
     "run_pipeline",
-    "WorkflowEngine",
 ]
 
 

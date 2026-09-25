@@ -14,13 +14,13 @@ immediate, attributable error rather than silent data corruption.
 
 from __future__ import annotations
 
-import hashlib
-import re
 from datetime import UTC, datetime
 from enum import StrEnum
+import hashlib
+import re
 from typing import Annotated, Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 # --------------------------------------------------------------------------- #
 # Shared primitives
@@ -34,15 +34,43 @@ def _path_parts(value: str) -> list[str]:
 
 
 class StrictModel(BaseModel):
-    """Base model rejecting unknown fields and normalising whitespace."""
+    """Base model rejecting unknown fields and normalising whitespace.
+
+    ``revalidate_instances="always"`` is deliberate. A checkpoint round-trip
+    restores the *outer* model but can leave nested models as plain dicts (the
+    serialiser allowlist is matched per type, not per nested attribute). Forcing
+    revalidation makes
+    :func:`~agentic_workflow.domain.state.as_model` deep-rebuild the object, so
+    nodes can always use attribute access — including on nested models — no
+    matter how the value happened to be stored.
+    """
 
     model_config = ConfigDict(
         extra="forbid",
         str_strip_whitespace=True,
         validate_assignment=True,
+        revalidate_instances="always",
         use_enum_values=False,
         ser_json_timedelta="iso8601",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_derived_extras(cls, data: Any) -> Any:
+        """Silently drop keys that are not declared fields.
+
+        A checkpoint serialiser writes computed fields (``line_count``,
+        ``content_hash``) into the stored mapping, and the model forbids extras.
+        Stripping undeclared keys *before* validation makes every model tolerant
+        of a round-trip through the store at every nesting level, while still
+        rejecting genuinely unknown input.
+        """
+        if not isinstance(data, dict):
+            return data
+        known = set(cls.model_fields)
+        if not data.keys() - known:
+            return data
+        return {k: v for k, v in data.items() if k in known}
 
 
 def utcnow() -> datetime:
@@ -241,7 +269,7 @@ class Finding(StrictModel):
         basis = f"{self.file or ''}:{self.line or 0}:{self.title.strip().lower()}"
         return hashlib.sha256(basis.encode()).hexdigest()[:16]
 
-    def model_post_init(self, _context: Any) -> None:  # noqa: D105
+    def model_post_init(self, _context: Any) -> None:
         """Fill an empty ``id`` deterministically (see :meth:`compute_id`)."""
         if not self.id:
             # Bypass validate_assignment re-entry by writing to __dict__.
@@ -463,7 +491,7 @@ class ApprovalDecision(StrictModel):
         """Normalise naive datetimes to UTC."""
         return value if value.tzinfo else value.replace(tzinfo=UTC)
 
-    def model_post_init(self, _context: Any) -> None:  # noqa: D105
+    def model_post_init(self, _context: Any) -> None:
         """Validate the decision/payload pairing on construction."""
         if self.decision is Decision.EDIT and not self.payload:
             raise ValueError("decision='edit' requires a non-empty `payload`")
@@ -514,8 +542,8 @@ __all__ = [
     "Category",
     "Confidence",
     "Decision",
-    "Finding",
     "FinalReport",
+    "Finding",
     "NodeTiming",
     "Patch",
     "ReviewRequest",

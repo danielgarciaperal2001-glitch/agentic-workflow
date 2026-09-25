@@ -188,7 +188,7 @@ class RunTimeoutError(WorkflowError):
     retryable = True
 
 
-class IterationLimitExceeded(WorkflowError):
+class IterationLimitExceededError(WorkflowError):
     """The agent feedback loop hit its maximum number of iterations."""
 
     code = ErrorCode.ITERATION_LIMIT
@@ -268,20 +268,30 @@ class ConnectionFailedError(WorkflowError):
 # Providers & agents
 # --------------------------------------------------------------------------- #
 class ProviderError(WorkflowError):
-    """An LLM provider returned an error or malformed output."""
+    """An LLM provider returned an error or malformed output.
+
+    Attributes:
+        retry_after: Seconds the provider asked us to wait, parsed from a
+            ``Retry-After`` header. ``None`` means "fall back to exponential
+            backoff". Part of the public contract: the retry loop reads it.
+    """
 
     code = ErrorCode.PROVIDER_ERROR
     retryable = True
 
+    def __init__(self, message: str = "", /, **context: Any) -> None:
+        self.retry_after: float | None = context.pop("retry_after", None)
+        super().__init__(message, **context)
 
-class ProviderRateLimited(ProviderError):
+
+class ProviderRateLimitedError(ProviderError):
     """The LLM provider rejected the request due to rate limiting."""
 
     code = ErrorCode.PROVIDER_RATE_LIMITED
     retryable = True
 
 
-class ProviderTimeout(ProviderError):
+class ProviderTimeoutError(ProviderError):
     """The LLM provider did not answer within the deadline."""
 
     code = ErrorCode.PROVIDER_TIMEOUT
@@ -339,11 +349,11 @@ __all__ = [
     "GraphExecutionError",
     "InvalidRequestError",
     "InvalidStateError",
-    "IterationLimitExceeded",
+    "IterationLimitExceededError",
     "PersistenceError",
     "ProviderError",
-    "ProviderRateLimited",
-    "ProviderTimeout",
+    "ProviderRateLimitedError",
+    "ProviderTimeoutError",
     "RateLimitedError",
     "RunAlreadyExistsError",
     "RunCancelledError",

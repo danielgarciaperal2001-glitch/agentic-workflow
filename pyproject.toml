@@ -157,6 +157,11 @@ ignore = [
   "D213",    # incompatible with D212
   "ISC001",  # conflicts with the formatter
   "RUF012",  # mutable class attrs are fine in pydantic models
+  # The error taxonomy in errors.py builds messages inline because the message is
+  # the API contract: splitting it into a local variable adds a line of noise to
+  # every raise without changing what a reader sees.
+  "EM101",
+  "EM102",
 ]
 
 [tool.ruff.lint.per-file-ignores]

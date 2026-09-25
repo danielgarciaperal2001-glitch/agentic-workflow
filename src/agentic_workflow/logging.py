@@ -15,10 +15,10 @@ Example
 
 from __future__ import annotations
 
-import logging
-import sys
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+import logging
+import sys
 from typing import Any
 
 import structlog
@@ -42,7 +42,7 @@ def configure_logging(settings: Settings | None = None, *, force: bool = False) 
         settings: Configuration to apply. Defaults to the process-wide settings.
         force: Reconfigure even if logging was already set up.
     """
-    global _configured  # noqa: PLW0603 - module-level install-once guard
+    global _configured
     if _configured and not force:
         return
 
@@ -52,12 +52,6 @@ def configure_logging(settings: Settings | None = None, *, force: bool = False) 
     # Keep third-party chatter out of our structured stream.
     for noisy in ("httpx", "httpcore", "urllib3", "asyncio", "langchain_core", "openai"):
         logging.getLogger(noisy).setLevel(max(log_level, logging.WARNING))
-
-    renderer: structlog.types.Processor = (
-        structlog.processors.JSONRenderer(sort_keys=True)
-        if settings.log_format is LogFormat.JSON
-        else structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty())
-    )
 
     shared: list[Any] = [
         structlog.contextvars.merge_contextvars,
@@ -138,15 +132,17 @@ def bind_context(**context: Any) -> Iterator[None]:
         >>> with bind_context(run_id="run_42", node="tester"):
         ...     get_logger(__name__).info("tests executed")
     """
-    tokens = []
+    tokens: dict[str, Any] = {}
     for key, value in context.items():
         if value is not None:
-            tokens.append((key, structlog.contextvars.bind_contextvars(**{key: value})))
+            tokens.update(structlog.contextvars.bind_contextvars(**{key: value}))
     try:
         yield
     finally:
-        for key, token in reversed(tokens):
-            structlog.contextvars.reset_contextvars(**{key: token})
+        # `bind_contextvars` returns one token per key; resetting them in a
+        # single call unwinds the whole scope, including nested re-bindings of
+        # the same key.
+        structlog.contextvars.reset_contextvars(**tokens)
 
 
 def current_context() -> dict[str, Any]:
@@ -155,7 +151,9 @@ def current_context() -> dict[str, Any]:
     return dict(ctx)
 
 
-def scrub(payload: Mapping[str, Any], *, redact_keys: frozenset[str] | None = None) -> dict[str, Any]:
+def scrub(
+    payload: Mapping[str, Any], *, redact_keys: frozenset[str] | None = None
+) -> dict[str, Any]:
     """Redact secret-looking keys from a mapping before logging it.
 
     Args:
@@ -175,7 +173,7 @@ def scrub(payload: Mapping[str, Any], *, redact_keys: frozenset[str] | None = No
         "token",
         "llm_api_key",
     }
-    keys = defaults | set(redact_keys or frozenset())
+    keys = frozenset(defaults | frozenset(redact_keys or frozenset()))
     out: dict[str, Any] = {}
     for key, value in payload.items():
         if key.lower() in keys:
