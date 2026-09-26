@@ -70,12 +70,63 @@ def _split_origins(value: str) -> list[str]:
     return [origin.strip() for origin in value.split(",") if origin.strip()]
 
 
+#: Environment-variable prefix. Applies to variables only — never to field names.
+ENV_PREFIX = "AWF_"
+
+
+def _reject_prefixed_kwargs(data: dict[str, Any]) -> None:
+    """Fail loudly on ``awf_``-prefixed configuration keys.
+
+    ``env_prefix="AWF_"`` applies to *environment variables* only. It does not
+    create aliases, so ``Settings(awf_max_parallel_runs=1)`` looks like a
+    perfectly good call — and is then discarded without a word, because the model
+    has to use ``extra="ignore"`` to survive an environment full of unrelated
+    variables such as ``PATH`` and ``HOME``.
+
+    That silence is the worst kind of configuration bug. A test that writes
+    ``awf_max_parallel_runs=1`` and watches the real limit of 8 apply instead is
+    green, fast, and completely wrong; the mistake only surfaces under load.
+    Turning it into an error that names the right argument costs one comparison.
+
+    Args:
+        data: Candidate field names and values.
+
+    Raises:
+        ValueError: If an ``awf_``-prefixed name is used as a field name.
+    """
+    # No field is itself named `awf_*` — the prefix belongs to the environment,
+    # not to the model — so any prefixed key is a mistake, full stop. Checking
+    # that the *unprefixed* form is a real field would be exactly backwards: it
+    # would reject the typo and accept the mistake.
+    prefixed = {
+        key
+        for key in data
+        if isinstance(key, str)
+        and key.lower().startswith(ENV_PREFIX.lower())
+        and key not in Settings.model_fields
+    }
+    if not prefixed:
+        return
+    suggestions = ", ".join(sorted(key[len(ENV_PREFIX) :] for key in prefixed))
+    raise ValueError(
+        f"Settings does not accept {ENV_PREFIX}-prefixed keyword arguments: "
+        f"{sorted(prefixed)}. The prefix applies to environment variables only; "
+        f"use the field name(s) directly: {suggestions}."
+    )
+
+
 class Settings(BaseSettings):
     """Immutable runtime configuration.
 
+    Two ways in, and they do not use the same names. Environment variables carry
+    the ``AWF_`` prefix (``AWF_LOG_LEVEL=DEBUG``); constructor arguments and
+    :func:`load_settings` overrides use the bare field name
+    (``log_level="DEBUG"``). Passing a prefixed name to the constructor is
+    rejected rather than ignored — see :func:`_reject_prefixed_kwargs`.
+
     Example
     -------
-    >>> settings = Settings(_env_file=None, awf_log_level="DEBUG")
+    >>> settings = Settings(_env_file=None, log_level="DEBUG")
     >>> settings.log_level
     'DEBUG'
     >>> settings.is_production
@@ -83,7 +134,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_prefix="AWF_",
+        env_prefix=ENV_PREFIX,
         env_file=".env",
         env_file_encoding="utf-8",
         env_nested_delimiter="__",
@@ -390,6 +441,29 @@ class Settings(BaseSettings):
             return parts[0]
         sep = "&" if "?" in parts[0] else "?"
         return f"{parts[0]}{sep}{existing}"
+
+    # ------------------------------------------------------------- guards #
+    def __init__(self, **kwargs: Any) -> None:
+        """Validate keyword arguments before pydantic-settings discards them.
+
+        ``BaseSettings.__init__`` merges its sources and drops keys that match no
+        field *before* the model sees them, so a ``before`` validator alone would
+        never observe the mistake this guard exists to catch.
+        """
+        _reject_prefixed_kwargs(kwargs)
+        super().__init__(**kwargs)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_prefixed_field_names(cls, data: Any) -> Any:
+        """Same guard as :meth:`__init__`, for the non-``__init__`` entry points.
+
+        ``model_validate`` and pydantic's own revalidation paths bypass the
+        constructor, and those must not be a way around the check.
+        """
+        if isinstance(data, dict):
+            _reject_prefixed_kwargs(data)
+        return data
 
     # ----------------------------------------------------------- utilities #
     def masked_api_key(self) -> str:
