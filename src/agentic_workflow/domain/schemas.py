@@ -20,12 +20,30 @@ import hashlib
 import re
 from typing import Annotated, Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 # --------------------------------------------------------------------------- #
 # Shared primitives
 # --------------------------------------------------------------------------- #
 Confidence = Annotated[float, Field(ge=0.0, le=1.0, description="Calibrated 0-1 confidence.")]
+
+#: Text whose bytes carry meaning and must survive validation untouched.
+#:
+#: ``StrictModel`` sets ``str_strip_whitespace=True``, which is right for titles
+#: and summaries and catastrophically wrong for source code: a file whose first
+#: line is indented loses that indentation, so a review of an indented block
+#: silently reviews different code than the one in the repository. The same
+#: applies to a diff, where the leading space of a context line is the marker
+#: that distinguishes context from an addition.
+Verbatim = Annotated[str, StringConstraints(strip_whitespace=False)]
 
 
 def _path_parts(value: str) -> list[str]:
@@ -56,21 +74,30 @@ class StrictModel(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _drop_derived_extras(cls, data: Any) -> Any:
-        """Silently drop keys that are not declared fields.
+    def _drop_computed_fields(cls, data: Any) -> Any:
+        """Drop *computed* fields before validation, but reject unknown ones.
 
         A checkpoint serialiser writes computed fields (``line_count``,
-        ``content_hash``) into the stored mapping, and the model forbids extras.
-        Stripping undeclared keys *before* validation makes every model tolerant
-        of a round-trip through the store at every nesting level, while still
-        rejecting genuinely unknown input.
+        ``content_hash``) into the stored mapping, and ``extra="forbid"`` would
+        reject the model's own output on the way back in. So the computed keys
+        are stripped here.
+
+        The distinction matters: only ``model_computed_fields`` is dropped. A key
+        that is not a field *at all* still raises, which is the entire point of
+        ``extra="forbid"`` — a typo'd ``reviewr=`` must not vanish silently and
+        leave a field at its default. Dropping all unknown keys would make the
+        strictness cosmetic.
         """
         if not isinstance(data, dict):
             return data
-        known = set(cls.model_fields)
-        if not data.keys() - known:
+        extras = data.keys() - set(cls.model_fields)
+        if not extras:
             return data
-        return {k: v for k, v in data.items() if k in known}
+        computed = set(cls.model_computed_fields)
+        if not extras & computed:
+            # Genuinely unknown input: let `extra="forbid"` reject it.
+            return data
+        return {k: v for k, v in data.items() if k in cls.model_fields}
 
 
 def utcnow() -> datetime:
@@ -206,7 +233,7 @@ class SourceFile(StrictModel):
     """A single source file under review."""
 
     path: str = Field(min_length=1, max_length=512, description="Repo-relative POSIX path.")
-    content: str = Field(default="", max_length=200_000, description="Full file content.")
+    content: Verbatim = Field(default="", max_length=200_000, description="Full file content.")
     language: str | None = Field(default=None, max_length=32)
 
     @field_validator("path")
@@ -287,7 +314,7 @@ class Patch(StrictModel):
         confidence: Author's confidence that the patch resolves the findings.
     """
 
-    diff: str = Field(default="", max_length=200_000)
+    diff: Verbatim = Field(default="", max_length=200_000)
     files_changed: list[str] = Field(default_factory=list, max_length=200)
     summary: str = Field(default="", max_length=8_000)
     strategy: str = Field(default="direct", max_length=64)
@@ -296,9 +323,19 @@ class Patch(StrictModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def diff_size(self) -> int:
-        """Number of changed lines (additions + removals) in the unified diff."""
+        """Number of changed lines (additions + removals) in the unified diff.
+
+        Diff *headers* (``--- a/x`` and ``+++ b/x``) are excluded. Counting them
+        would give a diff consisting only of headers and context a non-zero size,
+        and the router uses a zero size to decide that a patch is empty — so the
+        run would apply a no-op and report success for a change that was never
+        made.
+        """
         added = len(re.findall(r"^\+(?!\+\+)", self.diff, flags=re.MULTILINE))
-        removed = len(re.findall(r"^-(?!!)", self.diff, flags=re.MULTILINE))
+        # `(?!--)` rather than a bare `^-`: `--- a/x` starts with a minus, and a
+        # body line that itself begins with `--` (a removed comment divider, say)
+        # is a real change that must still be counted.
+        removed = len(re.findall(r"^-(?!--)", self.diff, flags=re.MULTILINE))
         return added + removed
 
     @property
@@ -377,7 +414,9 @@ class FinalReport(StrictModel):
     """
 
     report_id: str = Field(default="", max_length=128)
-    markdown: str = Field(default="", max_length=100_000)
+    # Verbatim: the report is Markdown, where indentation and trailing blank
+    # lines are structure. Stripping it would mangle every code block inside.
+    markdown: Verbatim = Field(default="", max_length=100_000)
     decision: Verdict = Verdict.BLOCKED
     findings: list[Finding] = Field(default_factory=list, max_length=200)
     metrics: dict[str, float] = Field(default_factory=dict)
@@ -432,7 +471,7 @@ class ApprovalRequest(StrictModel):
     confidence: Confidence = 0.0
     created_at: datetime = Field(default_factory=utcnow)
     expires_at: datetime | None = Field(default=None)
-    diff_preview: str = Field(default="", max_length=20_000)
+    diff_preview: Verbatim = Field(default="", max_length=20_000)
     requested_by: str = Field(default="system", max_length=128)
 
     @classmethod
