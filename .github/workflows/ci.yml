@@ -55,6 +55,20 @@ jobs:
       - name: Mypy — strict
         run: mypy src evals
 
+      - name: The README's Mermaid diagram parses
+        # The diagram is the first thing a reader sees and the only part of the
+        # project no test covers. Mermaid node ids silently collide with its
+        # keywords — `graph` being a node id is a parse error, not a style
+        # choice — and the failure mode is a diagram GitHub refuses to render,
+        # in the one file nobody opens in a code review.
+        #
+        # Network-dependent by nature: it asks the real parser rather than
+        # carrying a JavaScript runtime. `continue-on-error` because a CDN
+        # outage is not a broken diagram, and a check that is red for reasons
+        # outside the repository is a check people learn to ignore.
+        continue-on-error: true
+        run: python scripts/check_mermaid.py README.md
+
   # --------------------------------------------------------------------------- #
   # The test suite, with a real PostgreSQL so the checkpointer is exercised
   # against the store it exists for.
