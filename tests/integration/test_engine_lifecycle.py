@@ -27,6 +27,7 @@ import pytest
 from agentic_workflow.config import Settings
 from agentic_workflow.domain.schemas import Decision, ReviewRequest, Verdict
 from agentic_workflow.errors import (
+    CheckpointNotFoundError,
     ConcurrencyLimitError,
     InvalidStateError,
     RunAlreadyExistsError,
@@ -477,8 +478,27 @@ class TestTimeTravel:
         "iteration 2" would be shown iteration 5 and believe it.
         """
         outcome = await engine.start(make_request())
-        with pytest.raises(RunNotFoundError):
+        with pytest.raises(CheckpointNotFoundError):
             await engine.state_at(outcome.run_id, "1-0-0-not-a-real-checkpoint")
+
+    async def test_a_missing_checkpoint_is_distinct_from_a_missing_run(
+        self, engine: WorkflowEngine
+    ) -> None:
+        """The two demand opposite client behaviour, so they are different errors.
+
+        A bad checkpoint id is a typo to correct; a missing run is work that was
+        never submitted. Collapsing them told a client to resubmit a run that
+        already existed, which duplicates the review.
+        """
+        outcome = await engine.start(make_request())
+
+        with pytest.raises(CheckpointNotFoundError) as bad_checkpoint:
+            await engine.state_at(outcome.run_id, "1-0-0-nope")
+        with pytest.raises(RunNotFoundError):
+            await engine.status("a-run-that-never-ran")
+
+        assert not isinstance(bad_checkpoint.value, RunNotFoundError)
+        assert bad_checkpoint.value.context["checkpoint_id"] == "1-0-0-nope"
 
     async def test_replay_branches_without_destroying_the_original(
         self, engine: WorkflowEngine
@@ -504,7 +524,7 @@ class TestTimeTravel:
     async def test_replay_from_an_unknown_checkpoint_fails(self, engine: WorkflowEngine) -> None:
         """A replay target that does not exist is refused rather than ignored."""
         outcome = await engine.start(make_request())
-        with pytest.raises(RunNotFoundError):
+        with pytest.raises(CheckpointNotFoundError):
             await engine.replay_from(outcome.run_id, "not-a-checkpoint")
 
 
