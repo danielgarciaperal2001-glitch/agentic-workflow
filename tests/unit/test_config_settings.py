@@ -135,12 +135,18 @@ class TestInvariants:
         reset_settings_cache()
 
     def test_the_summary_never_leaks_a_secret(self) -> None:
-        """``safe_summary`` is logged at boot; a key in it is a key in the logs."""
+        """``safe_summary`` is logged at boot; a key in it is a key in the logs.
+
+        The fixture deliberately avoids any provider's real key shape. A value
+        matching ``sk_live_``/``sk-`` would be a valid credential to every
+        secret scanner, including the one guarding this repository's pushes,
+        and the test would block the push instead of testing the masking.
+        """
         settings = load_settings(llm_api_key="awf-fake-key-1234")
         summary = settings.safe_summary()
         rendered = repr(summary)
 
-        assert "super-secret" not in rendered
+        assert "awf-fake-key" not in rendered
         assert summary["llm_api_key"].endswith("1234")
         assert summary["llm_api_key"].startswith("****")
         reset_settings_cache()
