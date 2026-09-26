@@ -1,0 +1,56 @@
+{
+  "name": "agentic-workflow",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "onCreateCommand": "make venv",
+  "updateContentCommand": "make sync",
+  "postCreateCommand": "${containerWorkspaceFolder}/.venv/bin/python -c \"import agentic_workflow; print('agentic-workflow ready')\"",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "ms-python.mypy-type-checker"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "${containerWorkspaceFolder}/.venv/bin/python",
+        "python.analysis.typeCheckingMode": "strict",
+        "python.analysis.extraPaths": ["${containerWorkspaceFolder}/src"],
+        "ruff.enable": true,
+        "editor.formatOnSave": true,
+        "[python]": {
+          "editor.defaultFormatter": "charliermarsh.ruff"
+        },
+        "files.exclude": {
+          "**/__pycache__": true,
+          "**/.mypy_cache": true,
+          "**/.ruff_cache": true,
+          "**/.pytest_cache": true
+        },
+        "files.watcherExclude": {
+          "**/.venv/**": true
+        }
+      }
+    }
+  },
+  "forwardPorts": [8000, 5432],
+  "portsAttributes": {
+    "8000": {
+      "label": "API",
+      "onAutoForward": "notify"
+    },
+    "5432": {
+      "label": "PostgreSQL",
+      "onAutoForward": "silent"
+    }
+  },
+  "postAttachCommand": "echo 'agentic-workflow devcontainer ready. Try: make demo'",
+  "remoteUser": "vscode",
+  "remoteEnv": {
+    "PYTHONPATH": "${containerWorkspaceFolder}/src",
+    "AWF_ENVIRONMENT": "development"
+  }
+}

@@ -49,13 +49,31 @@ _RULES: tuple[tuple[str, str], ...] = (
 _SECURITY_RULES: tuple[tuple[str, str, str], ...] = (
     (r"\beval\s*\(", "Use of eval() enables arbitrary code execution", "security"),
     (r"\bexec\s*\(", "Use of exec() enables arbitrary code execution", "security"),
+    # SQL built by interpolating a value into the statement. The pattern used to
+    # require a literal `{}`, which is the *only* form that no longer occurs in
+    # practice: an f-string carries a name (`{term}`) and a `.format()` carries
+    # a `{}` outside the quotes entirely. Matching only the literal brace form
+    # meant the rule scored zero on the single most common injection shape.
     (
-        r"(?i)\b(sql|query)\s*=\s*[\"'].*\{\}",
-        "String-formatted SQL is vulnerable to injection",
+        r"(?i)\b(sql|query|statement)\w*\s*(?:=|:)\s*f?[\"'][^\n]*\{",
+        "SQL built by string interpolation is vulnerable to injection",
         "security",
     ),
     (
-        r"(?i)\b(password|secret|token|api_key)\s*=\s*[\"'][^\"']+[\"']",
+        r"(?i)\b(sql|query|statement)\w*[^\n]*\.(?:format|replace)\s*\(",
+        "SQL built by string formatting is vulnerable to injection",
+        "security",
+    ),
+    # A hard-coded credential. The pattern used to start with `\b`, which cannot
+    # match after an underscore because `_` is a word character — so the rule
+    # missed `PAYMENTS_API_KEY = "sk_live_..."`, the single most conventional
+    # way to write a secret in Python, while matching `api_key = "..."`.
+    (
+        (
+            r"(?i)(?<![a-z0-9])(?:[a-z0-9]*_)?"
+            r"(?:password|passwd|secret|token|api_key|apikey)"
+            r"\s*[:=]\s*[\"'][^\"']{6,}[\"']"
+        ),
         "Hard-coded credential detected",
         "security",
     ),
@@ -72,6 +90,12 @@ _SECURITY_RULES: tuple[tuple[str, str, str], ...] = (
 )
 
 _CODE_FENCE = re.compile(r"```(?P<lang>[\w+-]*)\n(?P<body>.*?)```", flags=re.DOTALL)
+
+#: A payload label is treated as a file path only if it looks like one. A
+#: description block is scanned by the rules but never cited, because
+#: attributing a finding to a file that does not exist is the exact hallucination
+#: the evaluation suite exists to catch.
+_PATH_LIKE = re.compile(r"[\w./-]+\.\w+")
 
 
 class EchoLLM(LLMClient):
@@ -310,6 +334,48 @@ def _finding_titles(prompt: str) -> list[str]:
     return [m.strip()[:120] for m in re.findall(r'"title"\s*:\s*"([^"]+)"', block.group(1))]
 
 
+def _attributed_lines(prompt: str) -> list[tuple[str, int, str]]:
+    """Split the prompt into ``(file, line_in_file, text)`` triples.
+
+    Only lines inside a delimited payload whose label is a real file path are
+    returned. That restriction is the point, and it is what makes a finding
+    trustworthy:
+
+    * A rule cannot fire on the *prompt's own* text. The word ``token`` in an
+      acceptance criterion must not read as a hard-coded credential, and a
+      description that quotes the vulnerable pattern must not be reported as
+      containing it.
+    * Every finding can name the file it is about, which is the difference
+      between a review a human can act on and a title they have to go hunting
+      for — and the evaluation suite's ``path_grounding`` and
+      ``citation_coverage`` metrics can then check the claim instead of
+      assuming it.
+
+    Args:
+        prompt: The rendered prompt.
+
+    Returns:
+        One triple per scannable line, in document order. Line numbers are
+        relative to the file, which is what a reader needs to jump to it.
+    """
+    triples: list[tuple[str, int, str]] = []
+    path: str | None = None
+    offset = 0
+    for line in prompt.splitlines():
+        if line.startswith("<<<UNTRUSTED_PAYLOAD:"):
+            label = line.split(":", 1)[1].strip()
+            path = label if _PATH_LIKE.fullmatch(label) else None
+            offset = 0
+            continue
+        if line.startswith("UNTRUSTED_PAYLOAD>>>"):
+            path = None
+            continue
+        if path is not None:
+            offset += 1
+            triples.append((path, offset, line))
+    return triples
+
+
 def _synthesise_findings(prompt: str) -> list[dict[str, Any]]:
     """Run the static rule set over the prompt and build a finding list.
 
@@ -324,25 +390,42 @@ def _synthesise_findings(prompt: str) -> list[dict[str, Any]]:
     Returns:
         Schema-shaped finding dicts, each with a unique identity.
     """
-    seen: dict[str, tuple[str, int]] = {}
-    for lineno, line in enumerate(prompt.splitlines(), start=1):
+    seen: dict[str, tuple[str, str, int]] = {}
+    for path, lineno, line in _attributed_lines(prompt):
         for pattern, title, category in _SECURITY_RULES:
             if re.search(pattern, line):
-                seen.setdefault(title, (category, lineno))
+                seen.setdefault(title, (category, path, lineno))
 
     if not seen:
-        seen = {"No obvious issue detected; consider adding a regression test": ("testing", 0)}
+        return [
+            {
+                "id": "",
+                "title": "No obvious issue detected; consider adding a regression test",
+                "detail": (
+                    "The rule set found nothing in this change. That is the absence "
+                    "of a match, not proof of correctness: a regex cannot read "
+                    "intent, so treat this as 'not covered', never as 'clean'."
+                ),
+                "severity": "medium",
+                "category": "testing",
+                "file": None,
+                "line": None,
+                "recommendation": "Apply the documented fix and add a regression test.",
+                "confidence": 0.2,
+            }
+        ]
 
     out: list[dict[str, Any]] = []
-    for title, (category, lineno) in seen.items():
+    for title, (category, path, lineno) in seen.items():
         out.append(
             {
                 "id": "",
                 "title": title,
-                "detail": f"Detected by the deterministic rule set at prompt line {lineno}.",
+                "detail": f"Detected by the deterministic rule set at {path}:{lineno}.",
                 "severity": "high" if category == "security" else "medium",
                 "category": category,
-                "line": lineno or None,
+                "file": path,
+                "line": lineno,
                 "recommendation": "Apply the documented fix and add a regression test.",
                 "confidence": 0.7,
             }

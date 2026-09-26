@@ -503,6 +503,7 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
         limit=args.limit,
         memory=True,
         gates=args.gates,
+        gate=args.gate,
     )
     if args.json:
         _out(report.as_dict())
@@ -535,7 +536,12 @@ async def _cmd_janitor(args: argparse.Namespace) -> int:
         log_level=args.log_level,
     )
     checkpointer = build_memory_checkpointer() if args.memory else build_checkpointer(settings)
-    _rule("checkpoint janitor" + ("  (dry run)" if args.dry_run else ""))
+    if not args.json:
+        # The rule is suppressed under --json so stdout carries the document and
+        # nothing else. `awf janitor --json | jq` has to work, and a banner above
+        # the JSON makes it unparseable — the failure is silent, because the
+        # output still looks like it printed something.
+        _rule("checkpoint janitor" + ("  (dry run)" if args.dry_run else ""))
     report = await CheckpointJanitor(checkpointer, settings).run(
         retention_days=args.retention_days,
         dry_run=args.dry_run,
@@ -701,6 +707,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="approve",
         choices=("approve", "edit", "reject"),
         help="Verdict applied at every gate (default: approve).",
+    )
+    evaluate.add_argument(
+        "--gate",
+        default="all",
+        choices=("all", "invariants", "detection"),
+        help=(
+            "Which metrics decide pass/fail. 'invariants' gates the "
+            "provider-independent correctness properties (no fabricated quotes, "
+            "no invented paths, no self-contradiction) and leaves recall as a "
+            "reported floor — use it to gate a build on the offline provider, "
+            "which cannot detect defects and would fail every run."
+        ),
     )
     evaluate.add_argument("--json", action="store_true", help="Emit raw JSON.")
     evaluate.set_defaults(handler=_cmd_eval)

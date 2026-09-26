@@ -63,30 +63,34 @@ lint: ## Lint
 
 .PHONY: typecheck
 typecheck: ## Static type check (strict)
-	$(MYPY) src
+	$(MYPY) src evals
 
 .PHONY: check
 check: fmt-check lint typecheck ## Run every static gate
 
 .PHONY: test
 test: ## Run the unit + integration test suite
-	$(PYTEST) -m "not slow and not eval" -q
+	$(PYTEST) -m "not slow and not postgres" -q
 
 .PHONY: test-all
-test-all: ## Run everything, including evals
+test-all: ## Run everything, including the postgres-marked tests
 	$(PYTEST) -q
 
 .PHONY: test-cov
 test-cov: ## Run tests with a coverage report
-	$(PYTEST) -m "not slow and not eval" --cov --cov-report=term-missing --cov-report=html -q
+	$(PYTEST) --cov --cov-report=term-missing --cov-report=html -q
 
 .PHONY: eval
-eval: ## Run the automated LLM-quality evaluation suite
-	$(PYTEST) -m eval -q --no-header -p no:randomly
+eval: ## Score the golden dataset and print the report
+	$(PY) -m agentic_workflow.cli eval
 
-.PHONY: eval-report
-eval-report: ## Produce a persisted evaluation report
-	$(PY) -m agentic_workflow.evals.report
+.PHONY: eval-json
+eval-json: ## Score the golden dataset, emit JSON for a CI job to consume
+	$(PY) -m agentic_workflow.cli eval --json
+
+.PHONY: bench
+bench: ## Measure the engine and print the tables quoted in the README
+	$(PY) benchmarks/bench.py
 
 # ---------------------------------------------------------------------------- #
 # Run
@@ -104,12 +108,20 @@ demo: ## Execute one pipeline run end-to-end and print the trace
 	$(PY) -m agentic_workflow.cli demo --run-id $(RUN_ID)
 
 .PHONY: replay
-replay: ## Replay a persisted run from a given checkpoint. Usage: make replay THREAD_ID=... STEP=-1
-	$(PY) -m agentic_workflow.cli replay --thread-id $(THREAD_ID) --step $(or $(STEP),-1)
+replay: ## Time travel. Usage: make replay RUN=<run_id> INDEX=-1
+	$(PY) -m agentic_workflow.cli replay $(RUN) $(if $(INDEX),--index $(INDEX),)
 
-.PHONY: graph
-graph: ## Render the LangGraph state machine to a PNG
-	$(PY) -m agentic_workflow.cli draw --out docs/diagrams/generated/graph.png
+.PHONY: history
+history: ## List a run's checkpoints. Usage: make history RUN=<run_id>
+	$(PY) -m agentic_workflow.cli replay $(RUN) --limit 50
+
+.PHONY: topology
+topology: ## Print the graph's nodes, edges, loops and routing table
+	$(PY) -m agentic_workflow.cli topology
+
+.PHONY: janitor
+janitor: ## Run one checkpoint-retention pass against the in-memory store
+	$(PY) -m agentic_workflow.cli janitor --memory --dry-run
 
 # ---------------------------------------------------------------------------- #
 # Infrastructure

@@ -86,7 +86,16 @@ def configure_logging(settings: Settings | None = None, *, force: bool = False) 
         ],
     )
 
-    handler = logging.StreamHandler(stream=sys.stdout)
+    # stderr, not stdout. The CLI's *result* goes to stdout — a JSON document
+    # from `awf eval --json`, a table from `awf janitor` — and a log line
+    # interleaved with it makes that output unparseable. `awf eval --json | jq`
+    # has to work, so diagnostics take the other stream. This also matches the
+    # colour decision above, which already asks whether *stderr* is a terminal.
+    #
+    # Under a container runtime both streams are captured, so this costs nothing
+    # for a server deployment and is the difference between a usable and an
+    # unusable CLI pipeline.
+    handler = logging.StreamHandler(stream=sys.stderr)
     handler.setFormatter(formatter)
 
     root = logging.getLogger()

@@ -1,0 +1,250 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch cancels the previous run. Without this a queue
+# of stale runs reports on code that is no longer on the branch, and the last
+# reported failure may belong to a commit that no longer exists.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_CACHE_DIR: "1"
+  FORCE_COLOR: "1"
+
+jobs:
+  # --------------------------------------------------------------------------- #
+  # Static gates. Fast, no services, and they fail on style and types before
+  # anything expensive runs.
+  # --------------------------------------------------------------------------- #
+  static:
+    name: lint & typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install with the dev extra
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff — lint
+        run: ruff check --output-format=github .
+
+      - name: Ruff — formatting
+        # `--check` only: a formatter that rewrites files in CI reports a
+        # green build on code nobody committed.
+        run: ruff format --check --diff .
+
+      - name: Mypy — strict
+        run: mypy src evals
+
+  # --------------------------------------------------------------------------- #
+  # The test suite, with a real PostgreSQL so the checkpointer is exercised
+  # against the store it exists for.
+  # --------------------------------------------------------------------------- #
+  test:
+    name: tests (postgres ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+        postgres: ["16"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_USER: awf
+          POSTGRES_PASSWORD: awf
+          POSTGRES_DB: awf_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U awf -d awf_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      AWF_TEST_POSTGRES_DSN: postgresql://awf:awf@localhost:5432/awf_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,api,postgres]"
+
+      - name: Wait for PostgreSQL
+        run: |
+          for attempt in $(seq 1 30); do
+            if pg_isready -h localhost -U awf -d awf_test; then exit 0; fi
+            echo "waiting for postgres ($attempt/30)"
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready" >&2
+          exit 1
+
+      - name: Run the suite with coverage
+        run: |
+          pytest \
+            --cov=agentic_workflow \
+            --cov-report=xml \
+            --cov-report=term-missing:skip-covered \
+            --cov-fail-under=85 \
+            -q
+
+      - name: Upload the coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-py${{ matrix.python }}
+          path: coverage.xml
+          retention-days: 7
+
+  # --------------------------------------------------------------------------- #
+  # The quality gate: the golden dataset, scored. Runs the real graph with the
+  # deterministic provider, so it is reproducible and needs no credentials.
+  # --------------------------------------------------------------------------- #
+  eval:
+    name: golden dataset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[api]"
+
+      - name: Score the dataset
+        # --gate invariants, not --gate all, and the distinction is the whole
+        # design of this job.
+        #
+        # The invariants (never quote code that was not submitted, never invent
+        # a path, never approve over your own critical finding) are properties of
+        # the *workflow*, and a deterministic stub can violate them exactly as
+        # well as a frontier model. Gating on them costs no token, needs no
+        # credentials, and gives the same answer on every run.
+        #
+        # Recall is a property of the *model*, and the null model has none by
+        # construction. Gating on it here would make this job red forever, and a
+        # job that is always red is a job everyone learns to ignore — the
+        # opposite of what a quality gate is for.
+        run: |
+          python -m agentic_workflow.cli eval \
+            --gate invariants --json > eval-report.json
+
+      - name: Summarise
+        if: always()
+        run: |
+          if [ -s eval-report.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          report = json.load(open("eval-report.json"))
+          gated = set(report["gate_metrics"] or ())
+          print("## Golden dataset\n")
+          print(f"**{report['cases_passed']}/{report['cases_run']} cases passed** "
+                f"(provider `{report['provider']}`, {report['duration_seconds']}s)\n")
+          print("| metric | mean | min | failed | n | gated |")
+          print("| --- | ---: | ---: | ---: | ---: | :-: |")
+          for metric, stats in report["metrics"].items():
+              print(f"| `{metric}` | {stats['mean']:.3f} | {stats['min']:.3f} "
+                    f"| {int(stats['failed'])} | {int(stats['counted'])} "
+                    f"| {'yes' if metric in gated else 'no'} |")
+          print()
+          print(f"Gate: **{', '.join(sorted(gated))}**.")
+          print()
+          print("The deterministic provider is a null model. Its recall is the "
+                "*floor* a real model has to beat, not a quality claim — which is "
+                "why recall is reported here and not gated.")
+          PY
+          else
+            echo "The eval suite produced no report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval-report.json
+          retention-days: 14
+
+  # --------------------------------------------------------------------------- #
+  # The image. Built with buildx so the multi-stage Dockerfile is exercised
+  # rather than assumed; `load` is deliberately absent because the job only has
+  # to prove it builds.
+  # --------------------------------------------------------------------------- #
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: agentic-workflow:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image starts and reports healthy
+        run: |
+          # Proves the entrypoint, the app factory and the health route all
+          # work in the built image. A build that succeeds and an image that
+          # boots are different claims, and only the second one is useful.
+          docker run -d --name awf -p 8000:8000 \
+            -e AWF_POSTGRES_ENABLED=false \
+            -e AWF_LOG_LEVEL=WARNING \
+            agentic-workflow:${{ github.sha }}
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health/live; then
+              echo "\nimage is live"
+              docker rm -f awf
+              exit 0
+            fi
+            echo "waiting for the API ($attempt/30)"
+            docker logs awf 2>&1 | tail -5
+            sleep 2
+          done
+
+          echo "The image never became healthy" >&2
+          docker logs awf 2>&1 | tail -50
+          exit 1

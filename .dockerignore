@@ -1,0 +1,85 @@
+# =============================================================================
+# Build context exclusions.
+#
+# Every entry here either does not belong in the image or would make the build
+# non-reproducible. The build context is sent to the daemon in full before the
+# first COPY, so a missing exclusion costs bandwidth on every build even when
+# the file is never copied.
+# =============================================================================
+
+# --- Version control -------------------------------------------------------- #
+.git
+.gitignore
+.github
+# The context can be a shallow clone; refusing the .git directory also keeps
+# the build working when git metadata is absent.
+.gitattributes
+
+# --- Virtual environments ---------------------------------------------------- #
+.venv
+venv
+env
+ENV
+
+# --- Caches and build artefacts ---------------------------------------------- #
+__pycache__
+*.py[cod]
+*$py.class
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.coverage
+.coverage.*
+coverage.xml
+htmlcov
+build
+dist
+*.egg-info
+*.egg
+.eggs
+
+# --- Secrets ---------------------------------------------------------------- #
+# The env file is the one thing that must never reach an image layer, where it
+# would survive in the history even if a later layer deleted it.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# --- Local data -------------------------------------------------------------- #
+*.sqlite
+*.sqlite3
+*.db
+postgres-data/
+pgdata/
+checkpoints/
+
+# --- Tests and tooling caches ------------------------------------------------ #
+.tox
+.nox
+.mypy.ini
+html/
+
+# --- Documentation that the image does not need ------------------------------ #
+# The image serves the API, not the docs site. Keeping them out keeps the
+# context small and avoids shipping the benchmark data alongside the service.
+docs/*.png
+docs/*.svg
+
+# --- Editor and OS noise ---------------------------------------------------- #
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Containers themselves -------------------------------------------------- #
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml
+.devcontainer/

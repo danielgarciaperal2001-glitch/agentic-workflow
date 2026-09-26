@@ -3,7 +3,6 @@
 # agentic-workflow — multi-stage production image
 # =============================================================================
 ARG PYTHON_VERSION=3.12
-ARG POETRY_VERSION=2.1.1
 
 # --------------------------------------------------------------------------- #
 # Builder: compile wheels so the runtime layer never needs a toolchain
