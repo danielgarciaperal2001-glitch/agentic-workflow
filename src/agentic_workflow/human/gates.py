@@ -66,6 +66,9 @@ log = get_logger(__name__)
 #: a reserved key keeps the user-facing fields at the top level.
 _METADATA_KEY = "__awf__"
 
+#: Prefix every derived gate identifier carries. See :func:`run_id_from_approval_id`.
+APPROVAL_ID_PREFIX = "apr_"
+
 
 # --------------------------------------------------------------------------- #
 # Signing
@@ -145,6 +148,37 @@ def approval_id_for(run_id: str, stage: Stage, iteration: int) -> str:
     material = f"{run_id}|{stage.value}|{iteration}".encode()
     digest = hashlib.sha256(material).hexdigest()[:8]
     return f"apr_{run_id}_{stage.value}_{iteration:02d}_{digest}"
+
+
+def run_id_from_approval_id(approval_id: str) -> str | None:
+    """Recover the run id an approval id was derived from.
+
+    The inverse of :func:`approval_id_for`, and it exists for a performance
+    reason: locating a gate's run by scanning every run's decision log is
+    O(runs) on the hot path of every human decision, and the answer is already
+    encoded in the id. Parsing is done from the right because stage names contain
+    underscores while run ids do not — the wire layer enforces that alphabet, so
+    the three trailing components are unambiguous.
+
+    Args:
+        approval_id: The gate identifier to invert.
+
+    Returns:
+        The run id, or ``None`` if the value is not a gate id this function can
+        parse. ``None`` means "ask the store", not "no such run".
+    """
+    if not approval_id.startswith(APPROVAL_ID_PREFIX):
+        return None
+    body = approval_id[len(APPROVAL_ID_PREFIX) :]
+    head, _, _digest = body.rpartition("_")
+    candidate, _, iteration = head.rpartition("_")
+    if not iteration.isdigit() or not candidate:
+        return None
+    for stage in Stage:
+        marker = f"_{stage.value}"
+        if candidate.endswith(marker):
+            return candidate[: -len(marker)] or None
+    return None
 
 
 def build_approval_request(
@@ -536,6 +570,7 @@ def assert_not_already_resolved(
 
 
 __all__ = [
+    "APPROVAL_ID_PREFIX",
     "PAYLOAD_LOG_LIMIT",
     "approval_id_for",
     "assert_not_already_resolved",
@@ -546,6 +581,7 @@ __all__ = [
     "gate_payload_for_stage",
     "record_decision_log",
     "request_decision",
+    "run_id_from_approval_id",
     "sign_decision",
     "verify_decision",
 ]

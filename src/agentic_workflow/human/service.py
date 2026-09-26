@@ -29,7 +29,12 @@ from agentic_workflow.errors import (
     InvalidStateError,
     RunNotFoundError,
 )
-from agentic_workflow.human.gates import assert_not_already_resolved, sign_decision, verify_decision
+from agentic_workflow.human.gates import (
+    assert_not_already_resolved,
+    run_id_from_approval_id,
+    sign_decision,
+    verify_decision,
+)
 from agentic_workflow.logging import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance
@@ -38,6 +43,12 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance
     from agentic_workflow.services.engine import RunOutcome, WorkflowEngine
 
 log = get_logger(__name__)
+
+#: Fields an :class:`ApprovalDecision` declares, derived from the model so the two
+#: cannot drift. A decision-log entry is a strict superset — it adds the gate's
+#: stage and the response latency — and rebuilding a decision from one therefore
+#: means projecting, not validating.
+_DECISION_FIELDS: frozenset[str] = frozenset(ApprovalDecision.model_fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +214,34 @@ class ApprovalService:
             ApprovalRejectedError: If the human rejected the action.
             InvalidStateError: If the payload cannot be interpreted.
         """
+        # The "already answered" check comes *before* the pending lookup, and the
+        # order is load-bearing. Once a gate is answered it is no longer pending,
+        # so asking the inbox first made every double-click a 404 — "no such
+        # approval" — when the truth is "that approval exists and you already
+        # answered it". The two send a client to opposite places: one retries,
+        # the other gives up on a run that is still healthy.
+        owner = run_id_from_approval_id(approval_id)
+        if owner is None:
+            # Not one of our derived ids. Fall back to searching, so a foreign or
+            # hand-built id still gets the same answer rather than a false 404.
+            try:
+                owner = await self._locate_run(approval_id)
+            except ApprovalNotFoundError:
+                owner = ""
+        if owner:
+            logged = [
+                entry
+                for entry in await self._decisions_for(owner)
+                if entry.get("approval_id") == approval_id
+            ]
+            if logged:
+                raise ApprovalAlreadyResolvedError(
+                    "this approval was already resolved",
+                    approval_id=approval_id,
+                    run_id=owner,
+                    decided_at=logged[0].get("decided_at"),
+                )
+
         view = await self.get(approval_id)
         request = view.request
 
@@ -211,11 +250,6 @@ class ApprovalService:
                 "approval window elapsed before a decision was recorded",
                 approval_id=approval_id,
                 run_id=request.run_id,
-            )
-        if view.already_resolved:
-            raise ApprovalAlreadyResolvedError(
-                "this approval was already resolved",
-                approval_id=approval_id,
             )
 
         resolved = self._build_decision(request, decision, reviewer, comment, payload)
@@ -270,12 +304,17 @@ class ApprovalService:
         for entry in recorded:
             if entry.get("approval_id") != approval_id:
                 continue
-            applied = ApprovalDecision.model_validate(entry)
+            # Compare against the *log entry*, not a re-validated model. The entry
+            # is the record this endpoint exists to honour, and it is deliberately
+            # a superset of the decision — it carries the stage and the response
+            # latency. Validating it as an `ApprovalDecision` failed on those extra
+            # keys and turned every retry into a 500, on the one path whose whole
+            # purpose is to recover from a lost answer.
             mismatch = {
                 key: {"recorded": recorded_value, "received": received}
                 for key, recorded_value, received in (
-                    ("decision", applied.decision.value, wanted),
-                    ("reviewer", applied.reviewer, reviewer),
+                    ("decision", str(entry.get("decision", "")).lower(), wanted),
+                    ("reviewer", str(entry.get("reviewer", "")), reviewer),
                 )
                 if recorded_value != received
             }
@@ -288,7 +327,9 @@ class ApprovalService:
                 )
             return ResolutionResult(
                 run_id=run_id,
-                decision=applied,
+                decision=ApprovalDecision.model_validate(
+                    {key: value for key, value in entry.items() if key in _DECISION_FIELDS}
+                ),
                 outcome=await self._engine.status(run_id),
                 replayed=True,
             )

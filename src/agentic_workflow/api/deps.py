@@ -257,26 +257,25 @@ def rate_limited(request: Request) -> None:
     state. Lazy creation also means a test that swaps the budget on a fresh app
     gets a fresh limiter instead of inheriting a stale window.
 
+    The typed :class:`~agentic_workflow.errors.RateLimitedError` is raised
+    rather than a bare ``HTTPException``: the domain handler turns it into the
+    standard envelope, which reports it as ``retryable`` — the one thing a
+    throttled client needs to know — and keeps the limit and the remaining window
+    that the limiter computed. A hand-rolled 429 answered "do not retry" while
+    simultaneously attaching a ``Retry-After`` header.
+
     Args:
         request: The inbound request.
 
     Raises:
-        HTTPException: 429 when the caller exceeded its budget.
+        RateLimitedError: When the caller exceeded its budget.
     """
     settings: Settings = request.app.state.settings
     limiter: RateLimiter | None = getattr(request.app.state, "rate_limiter", None)
     if limiter is None:
         limiter = RateLimiter(settings.api_rate_limit_per_minute)
         request.app.state.rate_limiter = limiter
-    try:
-        limiter.check(client_key(request, authorization=request.headers.get("authorization")))
-    except RateLimitedError as exc:
-        retry_after = str(exc.context.get("retry_after_seconds") or 1)
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=str(exc),
-            headers={"Retry-After": retry_after},
-        ) from exc
+    limiter.check(client_key(request, authorization=request.headers.get("authorization")))
 
 
 # --------------------------------------------------------------------------- #

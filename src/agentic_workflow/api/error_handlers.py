@@ -130,8 +130,12 @@ def error_response(
     headers: dict[str, str] = {}
     if exc.retryable:
         # Advertising `Retry-After` on every retryable error would be noise, but
-        # on the ones with a real backoff it lets a generic client behave.
-        headers["Retry-After"] = "1"
+        # on the ones with a real backoff it lets a generic client behave. The
+        # error's own value wins: the rate limiter already knows when its window
+        # rolls over, and a client that honours a pessimistic "1" retries early
+        # and is throttled again.
+        computed = exc.context.get("retry_after_seconds")
+        headers["Retry-After"] = str(int(float(computed)) + 1 if computed else 1)
     level = log.warning if status_code < 500 else log.error
     level(
         "api.error",
