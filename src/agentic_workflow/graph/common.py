@@ -8,6 +8,7 @@ rather than *how to run safely*.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 import time
 from typing import Any, ParamSpec, TypeVar
@@ -97,6 +98,16 @@ def node(
                         func(state, runtime), name, run_id, timeout_seconds
                     )
                 except BaseException as exc:
+                    if isinstance(exc, asyncio.CancelledError):
+                        # Cancellation is not a node failure and must never be
+                        # translated into one. `asyncio.Task.cancel()` lands here
+                        # as a `CancelledError` at the node's await point; wrapping
+                        # it would make `WorkflowEngine.cancel()` observe an
+                        # `AgentError` instead, mark the run `failed`, and lose
+                        # the distinction between "an operator stopped this" and
+                        # "this broke". Same for `KeyboardInterrupt`/`SystemExit`.
+                        node_log.info("node.cancelled")
+                        raise
                     if _is_control_flow(exc):
                         # `GraphInterrupt` / `GraphBubbleUp` are LangGraph's
                         # control-flow signals, not failures. Wrapping them in a
@@ -135,12 +146,13 @@ async def _with_timeout(
 ) -> dict[str, Any]:
     """Await *awaitable* under a deadline.
 
-    Uses :func:`asyncio.timeout` when available (3.11+) so the cancellation
-    propagates cleanly into the awaiting task, letting the checkpointer roll the
-    task back instead of leaving orphaned work behind.
+    Uses :func:`asyncio.timeout` so a timeout cancels the inner work cleanly,
+    letting the checkpointer roll the task back instead of leaving orphans
+    behind. An *external* cancellation is re-raised untouched, because
+    ``asyncio.timeout`` surfaces a deadline as ``TimeoutError`` and a
+    ``Task.cancel()`` as ``CancelledError`` — conflating them would let an
+    operator's cancel be reported as a node timeout.
     """
-    import asyncio
-
     if not timeout_seconds or timeout_seconds <= 0:
         return await awaitable
 
@@ -148,6 +160,10 @@ async def _with_timeout(
         async with asyncio.timeout(timeout_seconds):
             return await awaitable
     except TimeoutError as exc:
+        if isinstance(exc.__cause__, asyncio.CancelledError):
+            # `asyncio.timeout` re-raises a cancelled inner task as `TimeoutError`
+            # on some paths; a deadline we did not set must not become a timeout.
+            raise
         raise RunTimeoutError(
             f"node {name!r} exceeded its {timeout_seconds:.0f}s budget",
             run_id=run_id,

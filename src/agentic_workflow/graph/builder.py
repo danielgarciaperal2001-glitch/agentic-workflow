@@ -229,8 +229,15 @@ def graph_topology() -> dict[str, Any]:
             {"from": REPORTER, "to": "END", "kind": "static"},
             {"from": ROUTER, "to": "*", "kind": "conditional", "via": "decide_route"},
         ],
+        # Closed loops, written as the visited node sequence with the entry node
+        # repeated at the end. A cycle that repeats the entry node *mid*-sequence
+        # (as in ``[ROUTER, TESTER, ROUTER]``) implies a self-edge that does not
+        # exist, so every entry here names each node at most once per lap.
         "cycles": [
-            [PROGRAMMER, REVIEWER, ROUTER],
+            # Rejection path: a reviewer sends the work back to the author.
+            [PROGRAMMER, REVIEWER, ROUTER, PROGRAMMER],
+            # Validation path: the router dispatches to the tester, which reports
+            # back to the router.
             [ROUTER, TESTER, ROUTER],
         ],
         "routing_table": [list(entry) for entry in ROUTING_TABLE],
