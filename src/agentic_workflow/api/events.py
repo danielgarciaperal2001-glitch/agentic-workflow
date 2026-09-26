@@ -75,9 +75,19 @@ class ConnectionLimitError(WorkflowError):
         super().__init__(message, **context)
 
 
-@dataclass(slots=True)
+#: ``eq=False`` is load-bearing, not a style choice. The hub holds subscribers in
+#: a ``set`` keyed by identity, and a dataclass's generated ``__eq__`` sets
+#: ``__hash__`` to ``None`` — so the default made every ``subscribe()`` raise
+#: ``TypeError: unhashable type: 'Subscription'``. It would also have been the
+#: wrong comparison: two subscriptions with identical fields hold distinct
+#: queues, so structural equality would collapse them into one bucket entry and
+#: a client's events would be delivered to nobody.
+@dataclass(slots=True, eq=False)
 class Subscription:
     """One WebSocket client's view of the event stream.
+
+    Compared by identity, never by value: this object *is* the subscription, and
+    two clients watching the same run are two different subscribers.
 
     Attributes:
         run_id: The run being observed, or :data:`ANY_RUN`.

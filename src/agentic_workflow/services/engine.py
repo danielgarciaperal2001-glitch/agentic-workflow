@@ -56,6 +56,7 @@ from agentic_workflow.domain.schemas import (
 from agentic_workflow.domain.state import WorkflowState, as_model, as_models, initial_state
 from agentic_workflow.errors import (
     ApprovalRejectedError,
+    CheckpointNotFoundError,
     ConcurrencyLimitError,
     InvalidStateError,
     RunAlreadyExistsError,
@@ -272,6 +273,23 @@ class WorkflowEngine:
     def settings(self) -> Settings:
         """The engine's configuration."""
         return self._settings
+
+    def set_event_sink(self, sink: EventSink | None) -> None:
+        """Attach or replace the engine's event sink.
+
+        The sink is a *transport* detail, not a lifecycle one, so it is wired per
+        app instance rather than fixed at construction. An engine injected into
+        :func:`~agentic_workflow.api.app.create_app` was built with no sink, and
+        without this the application would come up healthy, accept the handshake
+        and then never emit a single event — the entire real-time surface dead,
+        with nothing logged. Re-pointing the sink replaces whatever the engine
+        already had; a caller that needs two consumers should compose them.
+
+        Args:
+            sink: Async callback receiving run and node events, or ``None`` to
+                detach the current one.
+        """
+        self._event_sink = sink
 
     @property
     def registry(self) -> RunRegistry:
@@ -552,7 +570,7 @@ class WorkflowEngine:
             The :class:`RunOutcome` at that point in time.
 
         Raises:
-            RunNotFoundError: If the checkpoint cannot be read.
+            CheckpointNotFoundError: If the run exists but the checkpoint does not.
         """
         snap = await self._read_checkpoint(run_id, checkpoint_id)
         return self._outcome_from_snapshot(run_id, snap)
@@ -582,7 +600,7 @@ class WorkflowEngine:
             The :class:`RunOutcome` of the branch.
 
         Raises:
-            RunNotFoundError: If the checkpoint cannot be read.
+            CheckpointNotFoundError: If the run exists but the checkpoint does not.
             RunTimeoutError: If the branch exceeds the run budget.
         """
         snap = await self._read_checkpoint(run_id, checkpoint_id)
@@ -615,8 +633,24 @@ class WorkflowEngine:
 
         Raises:
             RunNotFoundError: If the run is unknown.
+            InvalidStateError: If the run already reached a terminal status.
         """
         self._registry.get(run_id)
+        # A run that already finished cannot be cancelled, and forcing it would
+        # be destructive rather than defensive: the terminal status is the
+        # record of what happened, so a late "cancel" — a user clicking the
+        # button as a review completed, a retried request arriving after the
+        # fact — would rewrite "completed" to "cancelled" and leave the audit
+        # trail claiming an operator stopped work that had already shipped.
+        settled = await self._aget_state(run_id)
+        if settled is not None and not settled.next:
+            current = self._outcome_from_snapshot(run_id, settled)
+            if current.status in FINAL_STATUSES:
+                raise InvalidStateError(
+                    "run has already finished and cannot be cancelled",
+                    run_id=run_id,
+                    status=current.status,
+                )
         async with self._lock:
             # Marked *before* cancelling: the driving coroutine checks this flag to
             # tell "an operator cancelled me" from "my caller went away".
@@ -1014,18 +1048,27 @@ class WorkflowEngine:
             The resolved ``StateSnapshot``.
 
         Raises:
-            RunNotFoundError: If the thread or the checkpoint does not exist.
+            RunNotFoundError: If the checkpoint thread does not exist.
+            CheckpointNotFoundError: If the thread exists but the checkpoint does not.
         """
         try:
             snap = await self.graph.aget_state(_branch_config(run_id, checkpoint_id))
         except Exception as exc:
+            # The store itself refused the thread: nothing was ever written under
+            # this run id, so the run — not merely one of its checkpoints — is
+            # unknown. Conflating the two would tell a client to resubmit a run
+            # that already exists.
             log.debug("engine.checkpoint_unavailable", run_id=run_id, error=str(exc))
             raise RunNotFoundError(
-                "unknown checkpoint", run_id=run_id, checkpoint_id=checkpoint_id
+                "unknown checkpoint thread", run_id=run_id, checkpoint_id=checkpoint_id
             ) from exc
         resolved = _checkpoint_id(snap) if snap is not None else None
         if snap is None or not snap.values or resolved != checkpoint_id:
-            raise RunNotFoundError(
+            # The thread answered, so the run exists and the *checkpoint* does
+            # not. A distinct code is what lets a client tell a typo in the
+            # checkpoint id (retry with a corrected id) apart from a run that was
+            # never submitted.
+            raise CheckpointNotFoundError(
                 "unknown checkpoint",
                 run_id=run_id,
                 checkpoint_id=checkpoint_id,

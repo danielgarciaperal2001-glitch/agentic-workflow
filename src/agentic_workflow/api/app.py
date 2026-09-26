@@ -167,9 +167,15 @@ def create_app(
         app.state.rate_limiter = RateLimiter(resolved.api_rate_limit_per_minute)
 
         owned = engine is None
-        active = engine or WorkflowEngine(resolved, event_sink=hub.publish)
+        active = engine or WorkflowEngine(resolved)
         app.state.engine = active
         app.state.approvals = ApprovalService(active)
+        # Wired unconditionally, not only for an engine this app built. A hub is
+        # per-app state; an injected engine carries whatever sink it was built
+        # with, and an engine with no sink produces an app that accepts the
+        # WebSocket handshake and then emits nothing at all. The failure is
+        # silent, which is exactly what makes it worth guarding here.
+        active.set_event_sink(hub.publish)
 
         try:
             await active.startup()
