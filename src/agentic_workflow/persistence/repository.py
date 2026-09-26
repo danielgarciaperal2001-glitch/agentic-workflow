@@ -30,7 +30,7 @@ from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, get_args
 
 from agentic_workflow.domain.schemas import (
     ApprovalRequest,
@@ -64,6 +64,20 @@ RunStatus = Literal[
 #: Statuses that will not change again. Used by pollers to stop waiting.
 TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled", "rejected"})
 
+#: The runtime mirror of :data:`RunStatus`.
+#:
+#: A ``Literal`` annotation is a promise to a type checker, not a runtime check,
+#: and a ``dataclass`` enforces nothing. So this exists to make the promise real:
+#: a record carrying a status outside the vocabulary matches no status filter,
+#: is never in :data:`TERMINAL_STATUSES`, and is therefore invisible to every
+#: poller waiting for it to finish. A value like ``"triaged"`` is not a typo
+#: anyone would make by hand — it is what you get by copying a field out of the
+#: checkpoint's state, where the *graph's* notion of status has a different
+#: vocabulary from the engine's. That is exactly how one arrived here, and it
+#: failed silently: the record looked populated and reported a status no filter
+#: or terminal check recognised.
+RUN_STATUSES: frozenset[str] = frozenset(get_args(RunStatus))
+
 #: Distinguishes "argument omitted, leave the field alone" from
 #: "argument is None, clear the field". ``...`` would do it at runtime but
 #: ``Ellipsis`` is a real value, so a caller could accidentally collide with it.
@@ -95,6 +109,22 @@ class RunRecord:
     updated_at: str = field(default_factory=lambda: utcnow().isoformat())
     error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Reject a status outside the lifecycle vocabulary.
+
+        Runs at construction, so a bad status cannot exist in a record even
+        briefly — the alternative is a record that answers ``is_terminal`` and
+        every status filter with a silent ``False``, which for a poller means
+        waiting forever on a run that already finished.
+
+        Raises:
+            ValueError: If ``status`` is not one of :data:`RUN_STATUSES`.
+        """
+        if self.status not in RUN_STATUSES:
+            raise ValueError(
+                f"invalid run status {self.status!r}; expected one of {sorted(RUN_STATUSES)}"
+            )
 
     @property
     def is_terminal(self) -> bool:
@@ -328,45 +358,44 @@ class RunRegistry:
         return run_id in self._runs
 
     # ----------------------------------------------------------- recovery #
-    def rebuild_from(
-        self,
-        thread_ids: list[str],
-        *,
-        lookup: Any = None,
-    ) -> int:
+    def rebuild_from(self, entries: dict[str, dict[str, Any]]) -> int:
         """Repopulate the registry from durable checkpoint threads.
 
         Called on boot when the registry is empty but the database is not: a
         process that restarted must be able to show runs that were in flight.
+        Without it, every registry-backed path reports a live run as nonexistent
+        and cancelling one is impossible.
+
+        Takes *already-derived* projections, not raw checkpoint state. The
+        registry has no business interpreting a LangGraph state: the engine owns
+        the mapping from a snapshot to a :class:`RunOutcome`, and the two
+        vocabularies differ. The previous version read ``state["status"]``
+        directly, which is the *graph's* status — so a run parked on a human
+        gate was rehydrated as ``"triaged"``, a value no status filter and no
+        terminal check recognises. It passed every presence assertion and was
+        wrong about every field.
 
         Args:
-            thread_ids: Thread identifiers to hydrate.
-            lookup: Optional callable ``(thread_id) -> dict`` returning the
-                checkpoint's values (iteration, status…). Failures are tolerated:
-                a thread we cannot read is registered as ``pending`` rather than
-                crashing boot.
+            entries: Thread id to the projection of that thread, as
+                ``status``/``iteration``/``pending_approval``/``created_at``.
+                A thread absent from the mapping is registered as ``pending``:
+                a run that cannot be read is not the same as one that does not
+                exist, and only the listing tells them apart.
 
         Returns:
             The number of records created.
         """
         created = 0
-        for thread_id in thread_ids:
+        for thread_id, projection in entries.items():
             if thread_id in self._runs:
                 continue
-            state: dict[str, Any] = {}
-            if lookup is not None:
-                try:
-                    state = dict(lookup(thread_id) or {})
-                except Exception as exc:
-                    log.warning("run.rebuild_failed", thread_id=thread_id, error=str(exc))
-                    state = {}
             record = RunRecord(
                 run_id=thread_id,
                 thread_id=thread_id,
-                status=state.get("status") or "pending",
-                iteration=int(state.get("iteration") or 0),
-                pending_approval=state.get("pending_approval"),
-                created_at=state.get("started_at") or utcnow().isoformat(),
+                status=projection.get("status") or "pending",
+                iteration=int(projection.get("iteration") or 0),
+                pending_approval=projection.get("pending_approval"),
+                created_at=projection.get("created_at") or utcnow().isoformat(),
             )
             self._runs[thread_id] = record
             created += 1

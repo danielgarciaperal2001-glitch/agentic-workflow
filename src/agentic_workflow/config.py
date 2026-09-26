@@ -20,6 +20,7 @@ from __future__ import annotations
 from enum import StrEnum
 from functools import lru_cache
 from typing import Annotated, Any, Literal, Self
+from urllib.parse import quote, urlencode
 
 from pydantic import Field, SecretStr, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -72,6 +73,11 @@ def _split_origins(value: str) -> list[str]:
 
 #: Environment-variable prefix. Applies to variables only — never to field names.
 ENV_PREFIX = "AWF_"
+
+#: The schema used when none is configured, and the one PostgreSQL already
+#: searches by default. Naming it means "unset" is not spelled ``public`` in
+#: three separate comparisons that could drift.
+DEFAULT_SCHEMA = "public"
 
 
 def _reject_prefixed_kwargs(data: dict[str, Any]) -> None:
@@ -275,10 +281,26 @@ class Settings(BaseSettings):
         description="Server-side statement timeout guarding runaway queries.",
     )
     postgres_schema: str = Field(
-        default="public",
+        default=DEFAULT_SCHEMA,
         min_length=1,
         max_length=63,
-        description="Schema hosting the LangGraph checkpoint tables.",
+        pattern=r"^[a-z_][a-z0-9_]*$",
+        description=(
+            "Schema hosting the LangGraph checkpoint tables. Applied as a "
+            "`search_path` on every pooled connection, so the checkpointer's "
+            "unqualified DDL lands here. Must be a bare SQL identifier: the "
+            "backend parses `search_path` as SQL."
+        ),
+    )
+    recovery_max_runs: int = Field(
+        default=1_000,
+        ge=1,
+        le=100_000,
+        description=(
+            "Upper bound on the runs rehydrated into the registry on boot. A "
+            "restart must not stall on a large checkpoint table, and the "
+            "checkpointer remains the authoritative read either way."
+        ),
     )
     postgres_auto_setup: bool = Field(
         default=True,
@@ -434,13 +456,68 @@ class Settings(BaseSettings):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def dsn_with_timeout(self) -> str:
-        """Connection string with the statement timeout applied."""
-        parts = [self.postgres_dsn.rstrip(" ")]
-        existing = f"options='-c statement_timeout={self.postgres_statement_timeout_ms}'"
-        if "options=" in parts[0]:
-            return parts[0]
-        sep = "&" if "?" in parts[0] else "?"
-        return f"{parts[0]}{sep}{existing}"
+        """Connection string with the statement timeout applied.
+
+        The ``options`` parameter is percent-encoded, and it has to be. Its
+        value is itself a ``key=value`` pair (``-c statement_timeout=5000``), and
+        a raw ``=`` inside a URI query value is not a legal query value —
+        libpq reads the second ``=`` as the start of another parameter and
+        refuses the whole connection with ``extra key/value separator "=" in URI
+        query parameter: "options"``. Quote and the space becomes ``%20``, which
+        libpq percent-decodes back to exactly the string the server expects.
+
+        The failure this fixes was invisible until something actually tried to
+        connect: the DSN looked correct, the pool retried, and the symptom was
+        a 30-second connect timeout rather than a parse error naming the cause.
+        """
+        return self._dsn_with_options(f"-c statement_timeout={self.postgres_statement_timeout_ms}")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def checkpointer_dsn(self) -> str:
+        """Connection string for the checkpointer's pool.
+
+        Adds a ``search_path`` when the schema is not ``public``, which is how
+        :attr:`postgres_schema` is actually honoured.
+
+        ``AsyncPostgresSaver`` has no schema parameter, and its migrations are
+        unqualified ``CREATE TABLE IF NOT EXISTS``. So the setting *was* read,
+        validated, logged on every boot and on every ready event — and had no
+        effect whatsoever: every deployment and every test wrote to ``public``.
+        A setting that looks like it is working is worse than one that is
+        obviously absent, because multi-tenant isolation and test isolation
+        both depend on it and neither would show a failure.
+
+        The schema name reaches PostgreSQL as a libpq startup option, whose
+        value the backend parses as SQL. The field's ``pattern`` is therefore a
+        security control and not a style rule: it admits only what a bare
+        unquoted SQL identifier may contain, so a value like ``x, public`` —
+        which would silently redirect the search path to somewhere else — is
+        rejected at configuration time.
+        """
+        options = [f"-c statement_timeout={self.postgres_statement_timeout_ms}"]
+        if self.postgres_schema != DEFAULT_SCHEMA:
+            options.append(f"-c search_path={self.postgres_schema}")
+        return self._dsn_with_options(" ".join(options))
+
+    def _dsn_with_options(self, options: str) -> str:
+        """Append libpq startup *options* to the configured DSN.
+
+        Args:
+            options: The ``-c key=value`` string libpq should apply.
+
+        Returns:
+            The DSN, or the caller's own unchanged when they already set
+            ``options``. A caller who supplied their own is overriding the
+            defaults on purpose, and silently merging a second ``options=``
+            would be a DSN libpq itself rejects.
+        """
+        dsn = self.postgres_dsn.rstrip(" ")
+        if "options=" in dsn:
+            return dsn
+        encoded = urlencode({"options": options}, quote_via=quote)
+        sep = "&" if "?" in dsn else "?"
+        return f"{dsn}{sep}{encoded}"
 
     # ------------------------------------------------------------- guards #
     def __init__(self, **kwargs: Any) -> None:

@@ -29,7 +29,7 @@ from __future__ import annotations
 from types import TracebackType
 from typing import Any, Self
 
-from agentic_workflow.config import Settings, load_settings
+from agentic_workflow.config import DEFAULT_SCHEMA, Settings, load_settings
 from agentic_workflow.errors import ConfigurationError, PersistenceError
 from agentic_workflow.logging import get_logger
 from agentic_workflow.persistence.serializer import build_serializer
@@ -57,6 +57,7 @@ class PostgresCheckpointer:
         """
         self._settings = settings or load_settings()
         self._saver: Any | None = None
+        self._pool: Any | None = None
         self._entered = False
 
     # ------------------------------------------------------------------ #
@@ -98,7 +99,7 @@ class PostgresCheckpointer:
         )
         try:
             pool = AsyncConnectionFactory(
-                dsn=settings.dsn_with_timeout,
+                dsn=settings.checkpointer_dsn,
                 max_size=settings.postgres_pool_max_size,
                 min_size=settings.postgres_pool_min_size,
                 timeout=settings.postgres_pool_timeout_seconds,
@@ -109,6 +110,14 @@ class PostgresCheckpointer:
                     "sslmode": settings.postgres_sslmode,
                 },
             ).build()
+            # Held rather than recovered from the saver later. The previous
+            # `getattr(saver.conn, "_pool", saver.conn)` idiom was a guess, and
+            # a wrong one: psycopg's `AsyncConnectionPool` has a `_pool`
+            # attribute which is its internal `deque` of idle connections, not
+            # the pool. It happened to work only because the code then fell
+            # through to `saver.conn.open`, so the deque was discarded — by
+            # luck, in the one place that used it.
+            self._pool = pool
             return AsyncPostgresSaver(conn=pool, serde=build_serializer())
         except Exception as exc:
             raise PersistenceError(
@@ -122,45 +131,156 @@ class PostgresCheckpointer:
         Raises:
             PersistenceError: If the database is unreachable or the DDL fails.
         """
-        saver = self.saver
         if self._entered:
             return
-        conn = getattr(saver, "conn", None)
-        pool = getattr(conn, "_pool", conn)
-        opener = getattr(pool, "open", None) or getattr(conn, "open", None)
-        if opener is not None:
-            try:
-                await opener()
-            except Exception as exc:
-                raise PersistenceError(
-                    f"could not open the PostgreSQL pool: {exc}", stage="checkpointer"
-                ) from exc
-        if self._settings.postgres_auto_setup:
-            try:
-                await saver.setup()
-            except Exception as exc:
-                raise PersistenceError(
-                    f"could not create the checkpoint schema: {exc}", stage="checkpointer"
-                ) from exc
+        try:
+            saver = self.saver
+            # The held pool rather than digging the saver apart. See _build_saver
+            # for why the old guess was wrong.
+            pool = self.pool
+            opener = getattr(pool, "open", None)
+            if opener is not None:
+                try:
+                    await opener()
+                except Exception as exc:
+                    raise PersistenceError(
+                        f"could not open the PostgreSQL pool: {exc}", stage="checkpointer"
+                    ) from exc
+            if self._settings.postgres_auto_setup:
+                try:
+                    await self._ensure_schema(pool)
+                    await saver.setup()
+                except Exception as exc:
+                    raise PersistenceError(
+                        f"could not create the checkpoint schema: {exc}", stage="checkpointer"
+                    ) from exc
+        except BaseException:
+            # Release the pool on *this* failure rather than waiting for a
+            # later close(). The caller is `WorkflowEngine.startup`, which
+            # propagates the error and so never reaches its own `close`; a boot
+            # refused by the database — a read-only role, a schema another role
+            # owns — would otherwise leave real sockets open for the lifetime of
+            # the process, on the one path where the operator is already looking
+            # at something broken. `BaseException` because a cancelled setup
+            # leaves exactly the same mess, and a leaked pool is not the thing
+            # to fix by not cleaning up on the way out.
+            await self.close()
+            raise
         self._entered = True
         log.info("checkpointer.postgres.ready", schema=self._settings.postgres_schema)
 
+    @property
+    def pool(self) -> Any:
+        """The connection pool, built on first access.
+
+        Returns:
+            The ``AsyncConnectionPool`` backing the saver.
+        """
+        if self._pool is None:
+            self.saver  # noqa: B018 - building the saver is what builds the pool
+        return self._pool
+
+    async def _ensure_schema(self, pool: Any) -> None:
+        """Create the configured schema if it does not exist.
+
+        Necessary because the schema is applied as a ``search_path``, and a
+        ``search_path`` naming a schema that does not exist does not create one.
+        Every unqualified ``CREATE TABLE`` the saver's migrations issue would
+        then land in ``public`` anyway — precisely the behaviour this method
+        exists to remove.
+
+        The name is interpolated rather than bound because PostgreSQL will not
+        accept a parameter in ``CREATE SCHEMA IF NOT EXISTS``. That is safe only
+        because :attr:`Settings.postgres_schema` is pattern-constrained to a
+        bare unquoted SQL identifier; the constraint and this method have to
+        change together, and a test that feeds the field an injectable name is
+        what catches them drifting apart.
+
+        Args:
+            pool: The open connection pool.
+        """
+        schema = self._settings.postgres_schema
+        if schema == DEFAULT_SCHEMA:
+            return
+        # A checked-out connection rather than ``pool.cursor()``: the latter
+        # acquires a connection from under the pool's own lock, which a pool
+        # built with ``open_on_start=False`` does not release until its warm-up
+        # has finished. The call blocks there rather than failing, which is a
+        # far harder failure to diagnose than a refused one.
+        async with pool.connection() as connection:
+            await connection.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+
     async def close(self) -> None:
-        """Close the pool. Safe to call more than once."""
-        if not self._entered:
-            return
-        saver = self._saver
+        """Close the pool. Safe to call more than once.
+
+        Keyed on whether a pool was *built*, not on whether :meth:`setup`
+        finished. Those differ exactly when it matters: a pool is opened before
+        the DDL runs, so a boot that fails on ``CREATE SCHEMA`` — a permission
+        error, a read-only volume, a name another role already owns — has an
+        open pool holding real sockets and never sets ``_entered``. Returning
+        early on ``_entered`` therefore leaked the connections on precisely the
+        failure path where the operator is already looking at a problem, and
+        the "safe to call more than once" property was being bought with it.
+
+        The saver is dropped along with the pool, so that a later :meth:`setup`
+        builds a fresh one. Keeping it would leave a *closed* pool wired into the
+        saver and the second ``setup`` would then try to open a pool that no
+        longer exists — the difference between "this instance can be reused" and
+        "this instance is now quietly broken".
+        """
         self._entered = False
-        if saver is None:
+        pool = self._pool
+        self._pool = None
+        self._saver = None
+        if pool is None:
             return
-        conn = getattr(saver, "conn", None)
-        pool = getattr(conn, "_pool", conn)
-        closer = getattr(pool, "close", None) or getattr(conn, "close", None)
-        if closer is not None:
-            try:
-                await closer()
-            except Exception as exc:
-                log.warning("checkpointer.close_failed", error=str(exc))
+        closer = getattr(pool, "close", None)
+        if closer is None:
+            return
+        try:
+            await closer()
+        except Exception as exc:
+            log.warning("checkpointer.close_failed", error=str(exc))
+
+    async def list_thread_ids(self, *, limit: int = 10_000) -> list[str]:
+        """Return the checkpoint thread ids this database holds.
+
+        The engine needs this to rehydrate its run registry on boot. Without it
+        a restarted process knows about nothing that was in flight, and every
+        operator action that consults the registry — cancelling a run above all
+        — 404s for a run that demonstrably exists.
+
+        Enumerated through the saver's own ``alist`` rather than a hand-written
+        ``SELECT DISTINCT thread_id``: the table name, the ``checkpoint_ns``
+        column and the ordering are all the saver's business, and duplicating
+        them here is how a library upgrade silently breaks the boot path.
+
+        Args:
+            limit: Upper bound on the number of threads to return.
+
+        Returns:
+            Distinct thread ids, most recently checkpointed first. Empty when
+            enumeration is unsupported rather than when the database is empty —
+            the two are distinguished by the log line, not by the return value,
+            because a caller cannot act on either.
+        """
+        if not self._entered:
+            await self.setup()
+        threads: list[str] = []
+        seen: set[str] = set()
+        try:
+            async for item in self.saver.alist(None, limit=limit):
+                thread_id = (
+                    (getattr(item, "config", None) or {}).get("configurable", {}).get("thread_id")
+                )
+                if isinstance(thread_id, str) and thread_id not in seen:
+                    seen.add(thread_id)
+                    threads.append(thread_id)
+        except Exception as exc:
+            log.warning("checkpointer.thread_listing_failed", error=str(exc))
+            return []
+        log.info("checkpointer.threads_listed", found=len(threads))
+        return threads
 
     async def __aenter__(self) -> Self:
         """Open the pool and return ``self``."""

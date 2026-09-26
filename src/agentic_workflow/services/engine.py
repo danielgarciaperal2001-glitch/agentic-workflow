@@ -327,11 +327,87 @@ class WorkflowEngine:
             await setup()
         # Touching `.graph` compiles it, which is where wiring mistakes surface.
         _ = self.graph
+        await self._rehydrate_registry()
         self._started = True
         log.info(
             "engine.started",
             durable=self._settings.use_durable_checkpointer,
             hitl=self._settings.hitl_enabled,
+            runs=self._registry.count(),
+        )
+
+    async def _rehydrate_registry(self) -> None:
+        """Rebuild the run registry from durable checkpoint threads.
+
+        The registry is a *projection* of durable state, and a projection is only
+        a projection if it can be rebuilt. Without this, a process that restarts
+        — or a second replica joining a pool — has an empty registry while the
+        database is full of live runs, and every registry-backed path reports
+        them as nonexistent. ``RunRegistry.rebuild_from`` exists for exactly this
+        and nothing was calling it, so the boot-time claim in that method's
+        docstring was not true.
+
+        Bounded and best effort. A large ``checkpoints`` table must not turn a
+        restart into a long stall, and a database that cannot be listed is not a
+        reason to refuse to start: the checkpointer itself is already open by
+        this point, so a failure here is a degraded listing, not a lost run, and
+        every authoritative read still goes to the checkpointer.
+        """
+        lister = getattr(self._checkpointer, "list_thread_ids", None)
+        if lister is None:
+            return
+        try:
+            thread_ids = await lister(limit=self._settings.recovery_max_runs)
+        except Exception as exc:
+            log.warning("engine.registry_rehydrate_failed", error=str(exc))
+            return
+        if not thread_ids:
+            return
+        # Every thread is read *before* anything is handed over, and what is
+        # handed over is the engine's own projection of the run — never the raw
+        # checkpoint values. Two things went wrong when this passed state
+        # through, and both are worth recording:
+        #
+        # 1. `rebuild_from` was synchronous, so an async lookup gave it a
+        #    coroutine it could not await. It stored the truthy coroutine
+        #    object, fell back to `{}`, and registered every run as `pending` —
+        #    a registry that looked correctly populated and was wrong about all
+        #    of it, which is the worst shape a bug can take because the presence
+        #    check it exists to enable passes.
+        # 2. It then read `state["status"]`, which is the *graph's* status, not
+        #    the engine's. A run parked on a human gate came back as
+        #    `"triaged"`: not in the lifecycle vocabulary, matched by no status
+        #    filter, and not in TERMINAL_STATUSES, so a poller waited forever on
+        #    a run that had already finished.
+        #
+        # Reading first also lets the reads go concurrently, and going through
+        # `_outcome_from_snapshot` is what keeps the projection and the
+        # authoritative read derived from exactly the same code.
+        snapshots = await asyncio.gather(
+            *(self._aget_state(thread_id) for thread_id in thread_ids),
+            return_exceptions=True,
+        )
+        entries: dict[str, dict[str, Any]] = {}
+        for thread_id, snap in zip(thread_ids, snapshots, strict=True):
+            if isinstance(snap, BaseException):
+                log.warning("engine.registry_read_failed", thread_id=thread_id, error=str(snap))
+                continue
+            try:
+                outcome = self._outcome_from_snapshot(thread_id, snap)
+            except Exception as exc:
+                log.warning("engine.registry_project_failed", thread_id=thread_id, error=str(exc))
+                continue
+            entries[thread_id] = {
+                "status": outcome.status,
+                "iteration": outcome.iteration,
+                "pending_approval": outcome.pending.approval_id if outcome.pending else None,
+                "created_at": (outcome.state or {}).get("started_at"),
+            }
+        self._registry.rebuild_from(entries)
+        log.info(
+            "engine.registry_rehydrated",
+            runs=self._registry.count(),
+            unreadable=len(thread_ids) - len(entries),
         )
 
     async def shutdown(self) -> None:
@@ -635,7 +711,15 @@ class WorkflowEngine:
             RunNotFoundError: If the run is unknown.
             InvalidStateError: If the run already reached a terminal status.
         """
-        self._registry.get(run_id)
+        # Existence is decided by the checkpointer, not by the registry. The
+        # registry is per-process, so consulting it here made a run started by
+        # another replica impossible to cancel: the operator got a 404 for a
+        # run that demonstrably existed. `_aget_state` is the documented
+        # authoritative read, and this is exactly the moment that has to be
+        # true — cancelling is the one action a human takes to stop something
+        # they can see running somewhere else.
+        if await self._aget_state(run_id) is None:
+            raise RunNotFoundError("no checkpoint for this run", run_id=run_id)
         # A run that already finished cannot be cancelled, and forcing it would
         # be destructive rather than defensive: the terminal status is the
         # record of what happened, so a late "cancel" — a user clicking the
@@ -783,7 +867,7 @@ class WorkflowEngine:
                 self._running[resolved_run_id] = task
 
             try:
-                self._registry.update(resolved_run_id, status="running")
+                self._record(resolved_run_id, status="running")
                 await self._emit("run.started", run_id=resolved_run_id)
                 pending = await task
             except asyncio.CancelledError:
@@ -894,7 +978,7 @@ class WorkflowEngine:
                 log.warning("engine.unexpected_next", run_id=run_id, next=list(snap.next))
             outcome = self._outcome_from_snapshot(run_id, snap)
 
-        self._registry.update(
+        self._record(
             run_id,
             status=outcome.status,
             iteration=outcome.iteration,
@@ -935,7 +1019,7 @@ class WorkflowEngine:
             # anybody, and an outcome claiming otherwise would make the auto-
             # resolution loop try to answer a gate that is already closed.
             outcome.pending = None
-        self._registry.update(
+        self._record(
             run_id,
             status="rejected",
             error=reason,
@@ -961,7 +1045,7 @@ class WorkflowEngine:
             outcome.status = "cancelled"
             outcome.error = reason
             outcome.pending = None
-        self._registry.update(
+        self._record(
             run_id,
             status="cancelled",
             error=reason,
@@ -970,9 +1054,47 @@ class WorkflowEngine:
         await self._emit("run.cancelled", run_id=run_id, reason=reason, iteration=outcome.iteration)
         return outcome
 
+    def _record(self, run_id: str, **fields: Any) -> None:
+        """Write to the run registry, creating the record when this process lacks one.
+
+        The registry is a *per-process* projection of durable state, so a run
+        this process did not start has no record here: it may have been inherited
+        from the database on boot, or created by another replica entirely. Every
+        write path must therefore create before it updates.
+
+        Routing all of them through this one method is the point. Each write site
+        was individually reasonable and individually broken — the first
+        incarnation of this only guarded the failure path, and resuming or
+        cancelling a run from a second process still raised ``RunNotFoundError``
+        from ``update``, because three other call sites had the same assumption
+        written into them. A shared entry point is what makes the invariant
+        checkable; five copies of the same guard is five chances to forget it.
+
+        Args:
+            run_id: The run to write about.
+            **fields: Field updates, passed through to ``registry.update``.
+        """
+        if self._registry.find(run_id) is None:
+            self._registry.create(run_id)
+        self._registry.update(run_id, **fields)
+
     def _fail(self, run_id: str, message: str) -> None:
-        """Record a terminal failure on the registry."""
-        self._registry.update(run_id, status="failed", error=message, pending_approval=None)
+        """Record a terminal failure on the registry.
+
+        Must not raise, and must not be the thing that decides whether a failure
+        is reported. It sits in the ``except`` block of :meth:`_drive`, so an
+        exception here replaces the real error with a second, unrelated one and
+        the original cause is lost.
+
+        That is not hypothetical: the ``RunRegistry`` is per-process, so a run
+        that started in a *different* process has no record here, and
+        ``registry.update`` raised ``RunNotFoundError`` from inside the handler
+        for a genuine workflow error. The traceback named the registry and
+        nothing about what actually went wrong. An error path that can raise is
+        a diagnostic dead end, so the log line — the only place the truth
+        survives — always happens, whatever the registry does.
+        """
+        self._record(run_id, status="failed", error=message, pending_approval=None)
         log.error("run.failed", run_id=run_id, error=message)
 
     def _outcome_from_snapshot(
