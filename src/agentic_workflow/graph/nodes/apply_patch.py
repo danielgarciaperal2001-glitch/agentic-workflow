@@ -20,7 +20,7 @@ from typing import Any, ClassVar, Protocol
 
 from agentic_workflow.domain.schemas import Patch, ReviewResult
 from agentic_workflow.domain.state import WorkflowState, as_model
-from agentic_workflow.errors import InvalidStateError
+from agentic_workflow.errors import ApprovalRejectedError, InvalidStateError
 from agentic_workflow.graph.common import node
 from agentic_workflow.graph.context import context_from_runtime
 from agentic_workflow.graph.nodes.base import AgentNode
@@ -52,9 +52,9 @@ class PatchApplier(Protocol):
 class ApplyPatchAgent(AgentNode):
     """Apply the reviewed patch after an explicit human authorisation.
 
-    Raises:
-        ApprovalRejectedError: If the human rejects. The router catches this and
-            terminates the run cleanly rather than looping.
+    A rejection is recorded and routed to the reporter rather than raised: the
+    run must end with a documented decision, not with a stack trace and a
+    ``failed`` status.
     """
 
     name: ClassVar[str] = "apply_patch"
@@ -77,7 +77,6 @@ class ApplyPatchAgent(AgentNode):
 
         Raises:
             InvalidStateError: If there is no patch to apply.
-            ApprovalRejectedError: If the human rejects the change.
         """
         context = context_from_runtime(runtime)
         request = self.request(state)
@@ -112,19 +111,31 @@ class ApplyPatchAgent(AgentNode):
                 run_id=request.run_id,
             )
 
-        decision = await self.ask_human(
-            context,
-            state,
-            stage=Stage.PATCH_APPLY,
-            title=f"Apply patch touching {len(patch.files_changed)} file(s)?",
-            gate=gate,
-            payload={
-                **self.stage_payload(Stage.PATCH_APPLY, patch=patch, review=review),
-                "findings_addressed": render_findings(review.findings) if review else "(none)",
-            },
-            diff_preview=patch.diff,
-            iteration=iteration,
-        )
+        try:
+            decision = await self.ask_human(
+                context,
+                state,
+                stage=Stage.PATCH_APPLY,
+                title=f"Apply patch touching {len(patch.files_changed)} file(s)?",
+                gate=gate,
+                payload={
+                    **self.stage_payload(Stage.PATCH_APPLY, patch=patch, review=review),
+                    "findings_addressed": render_findings(review.findings) if review else "(none)",
+                },
+                diff_preview=patch.diff,
+                iteration=iteration,
+            )
+        except ApprovalRejectedError as exc:
+            # "No" is an answer, and the one this gate exists to collect. The run
+            # is *not* applied and the rejection is recorded; the router reads the
+            # verdict and sends the run to the reporter to document the refusal.
+            log.info(
+                "apply_patch.rejected",
+                run_id=request.run_id,
+                reviewer=exc.reviewer,
+                reason=str(exc),
+            )
+            return self.rejection_update(state, exc, stage=Stage.PATCH_APPLY)
 
         summary: dict[str, Any]
         if self.applier is not None:

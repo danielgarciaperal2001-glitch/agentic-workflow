@@ -16,6 +16,7 @@ from typing import Any, ClassVar, Protocol
 
 from agentic_workflow.domain.schemas import ReviewResult, TestReport
 from agentic_workflow.domain.state import WorkflowState, as_model
+from agentic_workflow.errors import ApprovalRejectedError
 from agentic_workflow.graph.common import node
 from agentic_workflow.graph.context import context_from_runtime
 from agentic_workflow.graph.nodes.base import AgentNode
@@ -113,15 +114,21 @@ class TesterAgent(AgentNode):
                 iteration=iteration,
             )
             if gate.required and report.failed > 0 and review is not None:
-                decision = await self.ask_human(
-                    context,
-                    state,
-                    stage=Stage.TEST_REVIEW,
-                    title=f"{report.failed} test(s) failing after iteration {iteration}",
-                    gate=gate,
-                    payload=self.stage_payload(Stage.TEST_REVIEW, tests=report, review=review),
-                    iteration=iteration,
-                )
+                try:
+                    decision = await self.ask_human(
+                        context,
+                        state,
+                        stage=Stage.TEST_REVIEW,
+                        title=f"{report.failed} test(s) failing after iteration {iteration}",
+                        gate=gate,
+                        payload=self.stage_payload(Stage.TEST_REVIEW, tests=report, review=review),
+                        iteration=iteration,
+                    )
+                except ApprovalRejectedError as exc:
+                    # Refusing to keep repairing a change whose tests will not go
+                    # green is a legitimate answer; the run ends with the refusal
+                    # on the record rather than looping to the iteration ceiling.
+                    return self.rejection_update(state, exc, stage=Stage.TEST_REVIEW)
                 update["human_decisions"] = [
                     self.decision_log(state, decision, Stage.TEST_REVIEW.value)
                 ]

@@ -43,6 +43,14 @@ from agentic_workflow.logging import get_logger
 
 log = get_logger(__name__)
 
+#: Lifecycle vocabulary for a run.
+#:
+#: ``rejected`` is deliberately distinct from ``cancelled`` and from ``failed``:
+#: a human said *no to this change*, which is a conclusion the workflow reached
+#: and an operator is entitled to. Reporting it as a failure would blame the
+#: system for the one thing it was built to let a person decide, and reporting
+#: it as a cancellation would erase the distinction between "stop this run" and
+#: "this change must not ship".
 RunStatus = Literal[
     "pending",
     "running",
@@ -50,10 +58,11 @@ RunStatus = Literal[
     "completed",
     "failed",
     "cancelled",
+    "rejected",
 ]
 
 #: Statuses that will not change again. Used by pollers to stop waiting.
-TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
+TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled", "rejected"})
 
 #: Distinguishes "argument omitted, leave the field alone" from
 #: "argument is None, clear the field". ``...`` would do it at runtime but

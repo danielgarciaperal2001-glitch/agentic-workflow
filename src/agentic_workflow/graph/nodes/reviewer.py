@@ -15,6 +15,7 @@ from typing import Any, ClassVar
 
 from agentic_workflow.domain.schemas import Finding, Patch, ReviewResult, Severity, Verdict
 from agentic_workflow.domain.state import WorkflowState, as_model
+from agentic_workflow.errors import ApprovalRejectedError
 from agentic_workflow.graph.common import node
 from agentic_workflow.graph.context import context_from_runtime
 from agentic_workflow.graph.nodes.base import AgentNode
@@ -91,17 +92,24 @@ class ReviewerAgent(AgentNode):
             iteration=iteration,
         )
         if gate.required:
-            decision = await self.ask_human(
-                context,
-                state,
-                stage=Stage.PATCH_REVIEW,
-                title=f"Review iteration {iteration}: {review.verdict.value} "
-                f"({review.blocking_count} blocking)",
-                gate=gate,
-                payload=self.stage_payload(Stage.PATCH_REVIEW, review=review),
-                diff_preview=patch.diff[:4_000] if patch else "",
-                iteration=iteration,
-            )
+            try:
+                decision = await self.ask_human(
+                    context,
+                    state,
+                    stage=Stage.PATCH_REVIEW,
+                    title=f"Review iteration {iteration}: {review.verdict.value} "
+                    f"({review.blocking_count} blocking)",
+                    gate=gate,
+                    payload=self.stage_payload(Stage.PATCH_REVIEW, review=review),
+                    diff_preview=patch.diff[:4_000] if patch else "",
+                    iteration=iteration,
+                )
+            except ApprovalRejectedError as exc:
+                # A reviewer who rejects the patch ends the run; the rejection
+                # becomes the verdict and the reporter documents it. The review
+                # is passed explicitly because this node re-runs on resume and the
+                # state it receives predates the review it is holding right here.
+                return self.rejection_update(state, exc, stage=Stage.PATCH_REVIEW, review=review)
             update["human_decisions"] = [
                 self.decision_log(state, decision, Stage.PATCH_REVIEW.value)
             ]

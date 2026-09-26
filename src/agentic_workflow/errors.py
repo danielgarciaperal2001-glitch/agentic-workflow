@@ -123,7 +123,18 @@ class WorkflowError(Exception):
 
         Lets low-level code raise a bare error and let an outer layer enrich it
         with correlation identifiers without re-raising.
+
+        ``run_id`` and ``thread_id`` are promoted to the dedicated attributes
+        rather than left in the free-form mapping. The API envelope exposes them
+        as top-level fields and clients branch on them, so a run id buried inside
+        ``context`` would be invisible to every consumer.
         """
+        run_id = context.pop("run_id", None)
+        thread_id = context.pop("thread_id", None)
+        if run_id is not None:
+            self.run_id = run_id
+        if thread_id is not None:
+            self.thread_id = thread_id
         self.context.update({k: v for k, v in context.items() if v is not None})
         return self
 
@@ -237,9 +248,31 @@ class ApprovalAlreadyResolvedError(WorkflowError):
 
 
 class ApprovalRejectedError(WorkflowError):
-    """A human explicitly rejected the proposed action."""
+    """A human explicitly rejected the proposed action.
+
+    Carries the originating :class:`~agentic_workflow.domain.schemas.ApprovalDecision`
+    and the stage it belonged to. A node that catches this to terminate the run
+    cleanly still owes the audit trail a record, and an exception that only
+    carried a message would force it to reconstruct one — at which point the one
+    decision that ends a run is the one most likely to end up unrecorded.
+    """
 
     code = ErrorCode.APPROVAL_REJECTED
+
+    def __init__(self, message: str = "", /, **context: Any) -> None:
+        self.decision: Any = context.pop("decision", None)
+        self.stage: str | None = context.pop("stage", None)
+        super().__init__(message, **context)
+
+    @property
+    def reviewer(self) -> str | None:
+        """Who rejected, when the decision is available."""
+        return getattr(self.decision, "reviewer", None) or self.context.get("reviewer")
+
+    @property
+    def approval_id(self) -> str | None:
+        """Which gate was rejected, when the decision is available."""
+        return getattr(self.decision, "approval_id", None) or self.context.get("approval_id")
 
 
 # --------------------------------------------------------------------------- #

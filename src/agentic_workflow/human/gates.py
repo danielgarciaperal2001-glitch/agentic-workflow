@@ -30,7 +30,7 @@ from datetime import timedelta
 import hashlib
 import hmac
 import json
-from typing import Any
+from typing import Any, Final
 
 from agentic_workflow.config import Settings
 from agentic_workflow.domain.schemas import (
@@ -319,13 +319,9 @@ def request_decision(
             approval_id=decision.approval_id,
         )
 
-    if decision.decision is Decision.REJECT:
-        raise ApprovalRejectedError(
-            decision.comment or "human rejected the proposed action",
-            approval_id=decision.approval_id,
-            reviewer=decision.reviewer,
-        )
-
+    # Logged before the rejection check: a rejection ends the run, and the log
+    # line is the only place the decision is guaranteed to be observed even when
+    # the caller lets the exception propagate.
     log.info(
         "hitl.decision_recorded",
         approval_id=decision.approval_id,
@@ -333,6 +329,16 @@ def request_decision(
         reviewer=decision.reviewer,
         stage=request.stage,
     )
+
+    if decision.decision is Decision.REJECT:
+        raise ApprovalRejectedError(
+            decision.comment or "human rejected the proposed action",
+            approval_id=decision.approval_id,
+            reviewer=decision.reviewer,
+            stage=request.stage,
+            decision=decision,
+        )
+
     return decision
 
 
@@ -353,10 +359,13 @@ def _coerce_decision(
         return raw
 
     if isinstance(raw, str):
+        # Trimmed: a bare string is the shape a human types, and "approve " is
+        # unambiguously the same intent as "approve". Refusing it with an enum
+        # error would read as a server fault rather than a typo.
         try:
             return ApprovalDecision(
                 approval_id=request.approval_id,
-                decision=Decision(raw.lower()),
+                decision=Decision(raw.strip().lower()),
                 reviewer=default_reviewer,
             )
         except ValueError as exc:
@@ -455,7 +464,7 @@ def record_decision_log(
         A JSON-serialisable audit record.
     """
     raised = created_at or decision.decided_at
-    return {
+    record: dict[str, Any] = {
         "approval_id": decision.approval_id,
         "stage": stage,
         "decision": decision.decision.value,
@@ -468,6 +477,45 @@ def record_decision_log(
         ),
         "run_id": run_id,
     }
+    if decision.payload:
+        # An `edit` decision's payload *is* the human's contribution. An audit
+        # trail that records "alice edited" without recording what she changed
+        # answers "was a human involved?" and not "what did they author?", which
+        # is the only reason to keep an audit trail at all. Bounded, because the
+        # payload may carry a whole diff and the log lives in every checkpoint.
+        record["payload"] = _bounded_payload(decision.payload)
+    return record
+
+
+#: Cap on the serialised human payload stored in the decision log. Large enough
+#: to hold a real edit request, small enough that a run's checkpoint history
+#: stays readable and cheap to page.
+PAYLOAD_LOG_LIMIT: Final = 4_000
+
+
+def _bounded_payload(payload: dict[str, Any], *, limit: int = PAYLOAD_LOG_LIMIT) -> dict[str, Any]:
+    """Return a log-sized view of a human decision payload.
+
+    Long strings are truncated rather than dropped: *what* the human wrote is the
+    evidence, so the head of a long message is far more useful than its absence.
+
+    Args:
+        payload: The decision payload as submitted.
+        limit: Maximum characters retained per string value.
+
+    Returns:
+        A JSON-serialisable copy with every string bounded.
+    """
+    bounded: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, str):
+            bounded[key] = value if len(value) <= limit else f"{value[:limit]}… [truncated]"
+        elif isinstance(value, list | dict):
+            encoded = json.dumps(value, default=str)
+            bounded[key] = value if len(encoded) <= limit else encoded[:limit] + "… [truncated]"
+        else:
+            bounded[key] = value
+    return bounded
 
 
 def assert_not_already_resolved(
@@ -488,6 +536,7 @@ def assert_not_already_resolved(
 
 
 __all__ = [
+    "PAYLOAD_LOG_LIMIT",
     "approval_id_for",
     "assert_not_already_resolved",
     "build_approval_request",

@@ -27,6 +27,7 @@ from agentic_workflow.domain.schemas import (
     utcnow,
 )
 from agentic_workflow.domain.state import WorkflowState, as_model, as_models
+from agentic_workflow.errors import ApprovalRejectedError
 from agentic_workflow.graph.common import node
 from agentic_workflow.graph.context import context_from_runtime
 from agentic_workflow.graph.nodes.base import AgentNode
@@ -139,16 +140,32 @@ class ReporterAgent(AgentNode):
             iteration=iteration,
         )
         if gate.required:
-            decision = await self.ask_human(
-                context,
-                state,
-                stage=Stage.FINAL_REPORT,
-                title=f"Sign off report {report.report_id} ({report.decision.value})",
-                gate=gate,
-                payload=self.stage_payload(Stage.FINAL_REPORT, report=report, review=review),
-                diff_preview=(patch.diff[:4_000] if patch else ""),
-                iteration=iteration,
-            )
+            try:
+                decision = await self.ask_human(
+                    context,
+                    state,
+                    stage=Stage.FINAL_REPORT,
+                    title=f"Sign off report {report.report_id} ({report.decision.value})",
+                    gate=gate,
+                    payload=self.stage_payload(Stage.FINAL_REPORT, report=report, review=review),
+                    diff_preview=(patch.diff[:4_000] if patch else ""),
+                    iteration=iteration,
+                )
+            except ApprovalRejectedError as exc:
+                # Refusing to sign off is the last word on the report, so the
+                # report is written with the rejection as its verdict and the run
+                # ends here. There is nothing left to route to.
+                refusal = self.rejection_update(state, exc, stage=Stage.FINAL_REPORT)
+                update["human_decisions"] = refusal["human_decisions"]
+                update["transcript"] = [
+                    *update["transcript"],
+                    *refusal["transcript"],
+                ]
+                update["report"] = report.model_copy(update={"decision": Verdict.REJECTED})
+                update["status"] = "rejected"
+                update["next_action"] = "end"
+                self.assert_owns(update)
+                return update
             update["human_decisions"] = [
                 self.decision_log(state, decision, Stage.FINAL_REPORT.value)
             ]

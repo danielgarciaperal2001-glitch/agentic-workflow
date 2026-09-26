@@ -55,6 +55,7 @@ from agentic_workflow.domain.schemas import (
 )
 from agentic_workflow.domain.state import WorkflowState, as_model, as_models, initial_state
 from agentic_workflow.errors import (
+    ApprovalRejectedError,
     ConcurrencyLimitError,
     InvalidStateError,
     RunAlreadyExistsError,
@@ -85,7 +86,12 @@ Decider = Callable[[ApprovalRequest], Any]
 RUN_STATUSES: Final[frozenset[str]] = frozenset(get_args(RunStatus))
 
 #: Statuses that will not change again.
-FINAL_STATUSES: Final[frozenset[str]] = frozenset({"completed", "failed", "cancelled"})
+FINAL_STATUSES: Final[frozenset[str]] = frozenset({"completed", "failed", "cancelled", "rejected"})
+
+#: Terminal statuses the *graph* cannot report about itself, because the node
+#: that would have written them raised or was interrupted instead. They are
+#: recorded on the registry and overlaid on every subsequent read.
+_OUTSIDE_OVERLAY_STATUSES: Final[frozenset[str]] = frozenset({"cancelled", "rejected"})
 
 
 @dataclass(slots=True)
@@ -548,9 +554,7 @@ class WorkflowEngine:
         Raises:
             RunNotFoundError: If the checkpoint cannot be read.
         """
-        snap = await self.graph.aget_state(_branch_config(run_id, checkpoint_id))
-        if snap is None or not (snap.values or snap.config):
-            raise RunNotFoundError("unknown checkpoint", run_id=run_id, checkpoint_id=checkpoint_id)
+        snap = await self._read_checkpoint(run_id, checkpoint_id)
         return self._outcome_from_snapshot(run_id, snap)
 
     async def replay_from(
@@ -581,9 +585,7 @@ class WorkflowEngine:
             RunNotFoundError: If the checkpoint cannot be read.
             RunTimeoutError: If the branch exceeds the run budget.
         """
-        snap = await self.graph.aget_state(_branch_config(run_id, checkpoint_id))
-        if snap is None or not (snap.values or snap.config):
-            raise RunNotFoundError("unknown checkpoint", run_id=run_id, checkpoint_id=checkpoint_id)
+        snap = await self._read_checkpoint(run_id, checkpoint_id)
         log.info(
             "engine.replay",
             run_id=run_id,
@@ -769,6 +771,20 @@ class WorkflowEngine:
                     run_id=resolved_run_id,
                     timeout_seconds=timeout,
                 ) from exc
+            except ApprovalRejectedError as exc:
+                # A human said no. That is the workflow reaching a conclusion, not
+                # a malfunction, so it is settled as a terminal `rejected` run
+                # and *not* re-raised: the caller asked a question ("what happened
+                # to this run?") and deserves an answer, not a stack trace. The
+                # REST layer already maps the error to 200 for the same reason.
+                self._running.pop(resolved_run_id, None)
+                rejected = await self._settle_rejected(
+                    resolved_run_id,
+                    str(exc),
+                    snap=await self._aget_state(resolved_run_id),
+                )
+                await self._emit_run_end(rejected)
+                return rejected
             except WorkflowError as exc:
                 self._fail(resolved_run_id, str(exc))
                 raise
@@ -853,16 +869,64 @@ class WorkflowEngine:
         )
         return outcome
 
+    async def _settle_rejected(
+        self, run_id: str, reason: str, *, snap: Any | None = None
+    ) -> RunOutcome:
+        """Project a rejected run, forcing the terminal ``rejected`` status.
+
+        The graph cannot record this itself: the node that asked for the decision
+        raised, so it never returned an update. The registry is the only place
+        the fact can live, which is why :meth:`_outcome_from_snapshot` overlays
+        it on every later read — the same mechanism cancellation relies on.
+
+        Args:
+            run_id: The rejected run.
+            reason: Human-readable justification, from the rejection itself.
+            snap: Post-raise checkpoint, when one could be read.
+
+        Returns:
+            The settled outcome, carrying everything the run achieved up to the
+            point it was rejected.
+        """
+        if snap is None:
+            outcome = RunOutcome(run_id=run_id, status="rejected", state={}, error=reason)
+        else:
+            outcome = self._outcome_from_snapshot(run_id, snap)
+            outcome.status = "rejected"
+            outcome.error = reason
+            # The gate that was rejected is still sitting in the checkpoint as
+            # "pending", so the projection above reports it. Clearing it here is
+            # what makes the value returned by `resume` agree with the value
+            # `status()` returns afterwards: a terminal run is not waiting on
+            # anybody, and an outcome claiming otherwise would make the auto-
+            # resolution loop try to answer a gate that is already closed.
+            outcome.pending = None
+        self._registry.update(
+            run_id,
+            status="rejected",
+            error=reason,
+            pending_approval=outcome.pending.approval_id if outcome.pending else None,
+        )
+        await self._emit("run.rejected", run_id=run_id, reason=reason, iteration=outcome.iteration)
+        return outcome
+
     async def _settle_cancelled(
         self, run_id: str, reason: str, *, snap: Any | None = None
     ) -> RunOutcome:
-        """Project a cancelled run, forcing the terminal ``cancelled`` status."""
+        """Project a cancelled run, forcing the terminal ``cancelled`` status.
+
+        The pending gate is cleared for the same reason as in
+        :meth:`_settle_rejected`: the checkpoint still lists the interrupted
+        approval, so the projection would otherwise hand back an outcome that
+        both says ``cancelled`` and says "waiting on a human".
+        """
         if snap is None:
             outcome = RunOutcome(run_id=run_id, status="cancelled", state={}, error=reason)
         else:
             outcome = self._outcome_from_snapshot(run_id, snap)
             outcome.status = "cancelled"
             outcome.error = reason
+            outcome.pending = None
         self._registry.update(
             run_id,
             status="cancelled",
@@ -908,10 +972,10 @@ class WorkflowEngine:
             status = _run_status(state_status)
 
         record = self._registry.find(run_id)
-        if record is not None and record.status == "cancelled":
-            status = "cancelled"
+        if record is not None and record.status in _OUTSIDE_OVERLAY_STATUSES:
+            status = record.status
             pending = None
-            values = {**values, "status": "cancelled"}
+            values = {**values, "status": record.status}
 
         return RunOutcome(
             run_id=run_id,
@@ -925,6 +989,49 @@ class WorkflowEngine:
             checkpoint_id=_checkpoint_id(snap),
             next_nodes=tuple(snap.next or ()),
         )
+
+    async def _read_checkpoint(self, run_id: str, checkpoint_id: str) -> Any:
+        """Load a specific historical checkpoint, or fail loudly.
+
+        LangGraph does **not** treat an unknown ``checkpoint_id`` as an error. It
+        echoes the requested id back in ``config`` and returns a snapshot with
+        empty ``values`` — indistinguishable at a glance from a real checkpoint.
+        A guard written as ``not (snap.values or snap.config)`` therefore passes
+        for a checkpoint that does not exist, and ``state_at``/``replay_from``
+        silently answer with the head of the run.
+
+        For a UI that scrubs through a run, that is the worst possible failure:
+        the operator inspects "iteration 1", is shown "iteration 4", and
+        believes it. So the discriminator is ``values`` alone — a snapshot with no
+        state is not a state anyone can look at — plus a check that the store
+        really resolved the id it was asked for.
+
+        Args:
+            run_id: Thread the checkpoint belongs to.
+            checkpoint_id: The checkpoint to read.
+
+        Returns:
+            The resolved ``StateSnapshot``.
+
+        Raises:
+            RunNotFoundError: If the thread or the checkpoint does not exist.
+        """
+        try:
+            snap = await self.graph.aget_state(_branch_config(run_id, checkpoint_id))
+        except Exception as exc:
+            log.debug("engine.checkpoint_unavailable", run_id=run_id, error=str(exc))
+            raise RunNotFoundError(
+                "unknown checkpoint", run_id=run_id, checkpoint_id=checkpoint_id
+            ) from exc
+        resolved = _checkpoint_id(snap) if snap is not None else None
+        if snap is None or not snap.values or resolved != checkpoint_id:
+            raise RunNotFoundError(
+                "unknown checkpoint",
+                run_id=run_id,
+                checkpoint_id=checkpoint_id,
+                resolved_checkpoint_id=resolved,
+            )
+        return snap
 
     async def _aget_state(self, run_id: str, checkpoint_id: str | None = None) -> Any | None:
         """Read a checkpoint, returning ``None`` when the thread is unknown.
@@ -1002,6 +1109,7 @@ class WorkflowEngine:
             "completed": "run.completed",
             "failed": "run.failed",
             "cancelled": "run.cancelled",
+            "rejected": "run.rejected",
         }.get(outcome.status, "run.parked")
         await self._emit(
             event,

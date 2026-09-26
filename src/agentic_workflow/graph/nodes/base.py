@@ -36,10 +36,11 @@ from agentic_workflow.domain.schemas import (
     ReviewResult,
     TaskBrief,
     TestReport,
+    Verdict,
     utcnow,
 )
-from agentic_workflow.domain.state import WorkflowState
-from agentic_workflow.errors import InvalidStateError
+from agentic_workflow.domain.state import WorkflowState, as_model
+from agentic_workflow.errors import ApprovalRejectedError, InvalidStateError
 from agentic_workflow.graph.common import transcript_entry
 from agentic_workflow.graph.context import AgentContext, context_from_runtime
 from agentic_workflow.human.gates import (
@@ -309,6 +310,90 @@ class AgentNode(ABC):
                 }
             ],
             "context": {"human_edits": updates},
+        }
+
+    # -------------------------------------------------------- rejection #
+    @classmethod
+    def rejection_update(
+        cls,
+        state: WorkflowState,
+        exc: ApprovalRejectedError,
+        *,
+        stage: Stage,
+        review: ReviewResult | None = None,
+    ) -> dict[str, Any]:
+        """Build the state update recorded when a human rejects at *stage*.
+
+        A rejection is a *verdict*, not a failure. Letting it unwind as an
+        exception would end the run with no ``human_decisions`` entry, no final
+        report, and a status of ``failed`` — three things that all misrepresent a
+        person exercising exactly the authority the workflow exists to give
+        them. So the rejection is turned back into an ordinary state update:
+        the decision is written to the audit log, the review verdict becomes
+        :attr:`Verdict.REJECTED`, and the router sends the run to the reporter to
+        document it.
+
+        The ``review`` verdict is written *unconditionally*, even when the gate
+        that was refused had no review behind it. The router decides where to go
+        from that verdict, so omitting it would strand the run: LangGraph re-runs
+        the gated node from the state *before* it executed, which means a node
+        that rejects on its own output — the reviewer — finds no review in
+        ``state`` and would leave the router with nothing to route on, sending
+        the run back to the gate that just refused it. Forever.
+
+        Args:
+            state: Current workflow state.
+            exc: The rejection raised by :func:`request_decision`.
+            stage: Gate the decision answered.
+            review: The review in play, when the caller has just produced one.
+
+        Returns:
+            A state update ready to be returned by the gated node.
+
+        Raises:
+            ApprovalRejectedError: If the error carries no decision, because a
+                rejection that cannot be recorded must not be swallowed.
+        """
+        decision = exc.decision
+        if decision is None:
+            # Recording a rejection we cannot attribute to a person and a gate
+            # would be theatre. Propagate so the run fails loudly instead.
+            raise exc
+
+        run_id = cls.request(state).run_id
+        current = review if review is not None else as_model(state, "review", ReviewResult)
+        reason = decision.comment or f"rejected at {stage.value}"
+
+        return {
+            # The router reads this verdict to choose the reporter, and the
+            # reporter derives the final decision from it, so this single write
+            # is what makes the whole run read as "a human said no".
+            "review": ReviewResult(
+                verdict=Verdict.REJECTED,
+                findings=current.findings if current else [],
+                summary=(
+                    current.summary
+                    if current and current.summary
+                    else f"rejected at {stage.value} by {decision.reviewer}"
+                ),
+                confidence=current.confidence if current else 0.0,
+                blocking_findings=current.blocking_findings if current else [],
+            ),
+            "human_decisions": [record_decision_log(decision, run_id=run_id, stage=stage.value)],
+            "next_action": "rejected",
+            "pending_approval": None,
+            "transcript": [
+                {
+                    "node": "hitl",
+                    "role": "human",
+                    "summary": f"rejected at {stage.value}: {reason}",
+                    "payload": {
+                        "decision": decision.decision.value,
+                        "reviewer": decision.reviewer,
+                    },
+                    "at": utcnow().isoformat(),
+                }
+            ],
         }
 
     # --------------------------------------------------------- guards    #
