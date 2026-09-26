@@ -21,7 +21,6 @@ Two invariants the whole suite relies on are enforced here:
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator, Iterator
 import os
 import socket
@@ -31,7 +30,6 @@ from fastapi.testclient import TestClient
 import pytest
 
 from agentic_workflow.config import Settings, load_settings, reset_settings_cache
-from agentic_workflow.domain.schemas import ReviewRequest, SourceFile
 from agentic_workflow.persistence.checkpointer import build_memory_checkpointer
 from agentic_workflow.services.engine import WorkflowEngine
 
@@ -242,6 +240,3 @@ def timeout_seconds() -> float:
         can be given more room without editing the suite.
     """
     return float(os.environ.get("AWF_TEST_TIMEOUT", "30"))
-
-
-__all__ = ["ReviewRequest", "SourceFile", "asyncio"]

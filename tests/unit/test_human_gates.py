@@ -25,6 +25,7 @@ from agentic_workflow.human.gates import (
     decode_interrupt,
     encode_interrupt,
     record_decision_log,
+    run_id_from_approval_id,
     sign_decision,
     verify_decision,
 )
@@ -76,6 +77,67 @@ class TestGateIdentity:
         forged = approval_id_for("run-1_patch_apply_01_deadbeef", Stage.PATCH_REVIEW, 0)
 
         assert forged != approval_id_for("run-1", Stage.PATCH_APPLY, 1)
+
+
+class TestApprovalIdInversion:
+    """The id encodes the run, which is what makes the hot path cheap.
+
+    Locating a gate's run by scanning every run's decision log is O(runs) on the
+    path every human decision takes. Parsing it out is O(1) — but only if the
+    inverse is exact, so these tests pin both directions.
+    """
+
+    @pytest.mark.parametrize("stage", list(Stage))
+    def test_every_stage_round_trips(self, stage: Stage) -> None:
+        identifier = approval_id_for("run-77", stage, 3)
+
+        assert run_id_from_approval_id(identifier) == "run-77"
+
+    def test_a_dotted_or_dashed_run_id_round_trips(self) -> None:
+        """The wire alphabet is ``[A-Za-z0-9._:-]``, so these are legal run ids."""
+        for run_id in ("acme.checkout-42", "req:1.2.3", "a", "0"):
+            identifier = approval_id_for(run_id, Stage.FINAL_REPORT, 0)
+
+            assert run_id_from_approval_id(identifier) == run_id
+
+    def test_a_run_id_with_a_digit_prefix_is_not_mistaken_for_a_stage(self) -> None:
+        """Parsing walks in from the right, so leading digits are irrelevant."""
+        identifier = approval_id_for("2024-final", Stage.PATCH_APPLY, 1)
+
+        assert run_id_from_approval_id(identifier) == "2024-final"
+
+    def test_a_run_id_named_after_a_stage_still_round_trips(self) -> None:
+        """``test_review`` as a run id is legal and must not be truncated away."""
+        identifier = approval_id_for("test_review", Stage.PATCH_APPLY, 1)
+
+        assert run_id_from_approval_id(identifier) == "test_review"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "approve",
+            "apr_",
+            "apr_no_stage",
+            "apr_run-1_patch_apply_deadbeef",  # no iteration
+            "apr_run-1_patch_apply_xx_deadbeef",  # iteration is not numeric
+            "apr_run-1_unknown_stage_01_deadbeef",
+        ],
+    )
+    def test_an_unparseable_id_yields_none(self, value: str) -> None:
+        """``None`` means "ask the store", never "no such run".
+
+        Guessing a run id from a malformed approval would let a client steer a
+        read at an arbitrary thread, so an unrecognised value must fall through
+        to the authoritative lookup.
+        """
+        assert run_id_from_approval_id(value) is None
+
+    def test_a_hostile_run_id_does_not_resolve_to_another_runs_name(self) -> None:
+        """The inversion must not be a way to redirect a lookup."""
+        identifier = approval_id_for("victim", Stage.PATCH_APPLY, 1)
+
+        assert run_id_from_approval_id(identifier) == "victim" != "attacker"
 
 
 class TestInterruptEncoding:
