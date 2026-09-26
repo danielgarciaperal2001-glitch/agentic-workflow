@@ -107,6 +107,10 @@ worker: ## Start the API with the embedded in-process run executor
 demo: ## Execute one pipeline run end-to-end and print the trace
 	$(PY) -m agentic_workflow.cli demo --run-id $(RUN_ID)
 
+.PHONY: demo-interactive
+demo-interactive: ## Same, but read every human gate verdict from the prompt
+	$(PY) -m agentic_workflow.cli demo --run-id $(RUN_ID) --interactive
+
 .PHONY: replay
 replay: ## Time travel. Usage: make replay RUN=<run_id> INDEX=-1
 	$(PY) -m agentic_workflow.cli replay $(RUN) $(if $(INDEX),--index $(INDEX),)

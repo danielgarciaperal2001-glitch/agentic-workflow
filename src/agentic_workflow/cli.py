@@ -118,6 +118,7 @@ async def _runtime(args: argparse.Namespace) -> _Runtime:
         A started runtime. The caller is responsible for shutting it down.
     """
     from agentic_workflow.config import load_settings
+    from agentic_workflow.logging import configure_logging
     from agentic_workflow.persistence.checkpointer import (
         build_checkpointer,
         build_memory_checkpointer,
@@ -126,10 +127,23 @@ async def _runtime(args: argparse.Namespace) -> _Runtime:
 
     settings = load_settings(
         llm_provider=args.provider,
-        postgres_enabled=not args.memory,
         log_level=args.log_level,
         graph_name=f"awf-cli-{args.command}",
+        # `--memory` is an override, not an inversion. Passing
+        # `postgres_enabled=not args.memory` unconditionally meant that omitting
+        # the flag *enabled* PostgreSQL — so `awf demo` on a fresh clone, with
+        # no database and no DSN, sat for 30 seconds retrying a connection
+        # nobody asked for. Omitting the key entirely lets the environment
+        # decide, which is the same choice `docker compose` already makes.
+        **({"postgres_enabled": False} if args.memory else {}),
     )
+    # Installed here, with these settings, and forced. `get_logger` lazily
+    # configures on first use with the *default* settings rather than the ones
+    # this command built, so without this line `--log-level` was accepted,
+    # printed in `--help`, and then ignored — every command logged at INFO.
+    # `force` because a module-level import may already have triggered the lazy
+    # path with the wrong settings, and a no-op reconfigure would leave them.
+    configure_logging(settings, force=True)
     checkpointer = build_memory_checkpointer() if args.memory else build_checkpointer(settings)
     engine = WorkflowEngine(settings, checkpointer=checkpointer)
     await engine.startup()
@@ -524,6 +538,7 @@ async def _cmd_janitor(args: argparse.Namespace) -> int:
         The process exit code.
     """
     from agentic_workflow.config import load_settings
+    from agentic_workflow.logging import configure_logging
     from agentic_workflow.persistence.checkpointer import (
         build_checkpointer,
         build_memory_checkpointer,
@@ -532,9 +547,15 @@ async def _cmd_janitor(args: argparse.Namespace) -> int:
 
     settings = load_settings(
         llm_provider=args.provider,
-        postgres_enabled=not args.memory,
         log_level=args.log_level,
+        # Same override-not-inversion rule as the engine-building commands: an
+        # omitted `--memory` honours AWF_POSTGRES_ENABLED rather than forcing a
+        # connection to a database the operator may not have.
+        **({"postgres_enabled": False} if args.memory else {}),
     )
+    # Installed with these settings, for the same reason as the other commands:
+    # otherwise --log-level is accepted and then ignored.
+    configure_logging(settings, force=True)
     checkpointer = build_memory_checkpointer() if args.memory else build_checkpointer(settings)
     if not args.json:
         # The rule is suppressed under --json so stdout carries the document and
