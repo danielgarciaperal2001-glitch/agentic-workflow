@@ -774,7 +774,32 @@ class WorkflowEngine:
         )
 
     def _admit(self, run_id: str) -> None:
-        """Enforce the concurrency ceiling. Caller must hold ``self._lock``."""
+        """Enforce per-run exclusion and the global ceiling.
+
+        Caller must hold ``self._lock``.
+
+        The per-run check has to live here rather than in :meth:`resume`.
+        ``resume`` decides whether the run is parked by reading the checkpointer,
+        and that read is not held across the gap before ``_drive`` claims the run,
+        so two callers can both observe "parked" and both drive. Here the check
+        and the registration happen under one lock, which is what makes
+        claiming atomic.
+
+        The global ceiling alone is not sufficient. ``_running`` is keyed by run
+        id, so a second task for the same id replaces the first one's handle
+        rather than coexisting with it: the original becomes unreachable —
+        ``cancel`` can no longer see it, so it could not be interrupted — and the
+        node after the gate executes twice against the same thread. Replaying a
+        run that is still in flight is the same hazard, and the same check
+        rejects it, which is right in its own terms: the history being branched
+        from is still being written.
+        """
+        existing = self._running.get(run_id)
+        if existing is not None and not existing.done():
+            raise RunAlreadyExistsError(
+                "run is already in flight and cannot be driven twice at once",
+                run_id=run_id,
+            )
         live = [task for task in self._running.values() if not task.done()]
         if len(live) >= self._settings.max_parallel_runs:
             raise ConcurrencyLimitError(

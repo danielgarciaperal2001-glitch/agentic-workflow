@@ -527,6 +527,47 @@ class TestTimeTravel:
         with pytest.raises(CheckpointNotFoundError):
             await engine.replay_from(outcome.run_id, "not-a-checkpoint")
 
+    async def test_replay_refuses_a_run_still_in_flight(self) -> None:
+        """Time-travelling into a live run is refused.
+
+        A branch is written to the same thread as the run it forks from, so
+        replaying a run that is still executing interleaves two histories on one
+        thread id. It also takes the same ``_running`` slot the live task holds,
+        orphaning it. Both are reasons to refuse rather than reorder.
+        """
+        inside = asyncio.Event()
+        release = asyncio.Event()
+
+        async def sink(event: dict[str, Any]) -> None:
+            # The first event a run publishes is `run.started`, emitted once its
+            # task is already registered in `_running`. Blocking there holds the
+            # run genuinely mid-flight.
+            if not inside.is_set():
+                inside.set()
+                await release.wait()
+
+        engine = WorkflowEngine(
+            Settings(_env_file=None, llm_provider="echo", log_level="ERROR"),
+            checkpointer=build_memory_checkpointer(),
+            event_sink=sink,
+        )
+        await engine.startup()
+        try:
+            request = make_request()
+            occupying = asyncio.create_task(engine.start(request))
+            await asyncio.wait_for(inside.wait(), timeout=10)
+            history = await engine.history(request.run_id)
+
+            with pytest.raises(RunAlreadyExistsError):
+                await engine.replay_from(request.run_id, history[0].checkpoint_id)
+
+            release.set()
+            await asyncio.wait_for(occupying, timeout=10)
+        finally:
+            release.set()
+            await engine.cancel_all()
+            await engine.shutdown()
+
 
 class TestCancellation:
     """Stopping work in flight."""
@@ -619,6 +660,66 @@ class TestConcurrency:
 
             release.set()
             assert (await asyncio.wait_for(occupying, timeout=10)).is_parked
+        finally:
+            release.set()
+            await engine.cancel_all()
+            await engine.shutdown()
+
+    async def test_two_concurrent_resumes_cannot_drive_one_run(self) -> None:
+        """A parked run accepts one resume at a time.
+
+        ``resume()`` reads the status, concludes the run is parked, and then
+        drives it. Nothing is held across the gap between those two steps, so a
+        second caller does exactly the same thing and both believe they own the
+        run. The second ``create_task`` overwrites the first one's handle in
+        ``_running``, which orphans it — ``cancel()`` can no longer see it — and
+        the node after the gate then executes twice against the same thread.
+
+        That is not a duplicated log line. A patch gate is precisely where a
+        resumed run applies a diff, so a lost race here is a double-apply of
+        someone else's code change.
+        """
+        inside = asyncio.Event()
+        release = asyncio.Event()
+        armed = False
+
+        async def sink(event: dict[str, Any]) -> None:
+            nonlocal armed
+            # Armed only after the run is parked, so `start` is not blocked.
+            # The first event a resume emits is `run.started`, which is published
+            # after the task is registered in `_running` — exactly the window
+            # the race needs.
+            if armed and not inside.is_set():
+                inside.set()
+                await release.wait()
+
+        engine = WorkflowEngine(
+            Settings(
+                _env_file=None,
+                llm_provider="echo",
+                log_level="ERROR",
+                max_parallel_runs=8,
+            ),
+            checkpointer=build_memory_checkpointer(),
+            event_sink=sink,
+        )
+        await engine.startup()
+        try:
+            parked = await engine.start(make_request())
+            assert parked.is_parked
+
+            armed = True
+            first = asyncio.create_task(engine.resume(parked.run_id, _approve(parked.pending)))
+            await asyncio.wait_for(inside.wait(), timeout=10)
+
+            with pytest.raises(RunAlreadyExistsError):
+                await engine.resume(parked.run_id, _approve(parked.pending))
+
+            # The refusal must not have disturbed the run that legitimately owns
+            # the slot: a guard that clobbered state would trade a double-apply
+            # for a lost run.
+            release.set()
+            assert await asyncio.wait_for(first, timeout=10) is not None
         finally:
             release.set()
             await engine.cancel_all()
