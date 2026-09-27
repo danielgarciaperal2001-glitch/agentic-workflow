@@ -369,10 +369,68 @@ class Settings(BaseSettings):
         description="Let humans rewrite agent output before resuming.",
     )
     hitl_allow_reject: bool = Field(default=True)
+    hitl_signing_secret: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Key that signs human decisions in the audit log. Falls back to "
+            "`api_auth_token` when unset. Never derived from `llm_api_key`: a "
+            "provider credential rotates at the provider's convenience, which "
+            "would retroactively invalidate every signature ever written."
+        ),
+    )
     hitl_require_signature: bool = Field(
         default=True,
-        description="Sign decisions and persist them in the immutable audit log.",
+        description=(
+            "Sign decisions and persist them in the audit log. When no signing "
+            "secret is resolvable the signatures are skipped, which `startup` "
+            "reports — see `signing_warning`."
+        ),
     )
+
+    def resolved_signing_secret(self) -> str:
+        """Return the key decisions are signed with, or ``""`` when there is none.
+
+        The audit trail is only tamper-evident if one secret holds still. An
+        operator supplies a dedicated one; the API token is accepted as a
+        convenience so a small deployment need not manage a second secret. The
+        LLM credential is deliberately not a candidate: it belongs to a third
+        party, is the widest-distributed secret in most deployments, and would
+        tie the integrity of the audit log to whether an LLM happens to be
+        configured.
+
+        Returns:
+            The secret, or an empty string if signatures cannot be produced.
+        """
+        for candidate in (self.hitl_signing_secret, self.api_auth_token):
+            if candidate is None:
+                continue
+            value = candidate.get_secret_value()
+            if value:
+                return value
+        return ""
+
+    def signing_warning(self) -> str | None:
+        """Describe a signature promise this configuration cannot keep.
+
+        The requirement defaults to on, but the out-of-the-box deployment has
+        nothing to sign with: the API is unauthenticated and the provider is the
+        offline echo. Silently writing an unsigned decision while the setting
+        says signatures are written is the worst of both — the operator reads
+        the config, concludes the log is tamper-evident, and is wrong.
+
+        Returns:
+            A message to log once at boot, or ``None`` when there is nothing to
+            report.
+        """
+        if not self.hitl_require_signature or self.resolved_signing_secret():
+            return None
+        return (
+            "hitl_require_signature is enabled but no signing secret is "
+            "available, so human decisions are recorded UNSIGNED. Set "
+            "AWF_HITL_SIGNING_SECRET (or api_auth_token) to make the audit log "
+            "tamper-evident, or set hitl_require_signature=false to record that "
+            "unsigned decisions are intended."
+        )
 
     # -------------------------------------------------------------- eval  #
     eval_provider: EvalProvider = Field(default=EvalProvider.NATIVE)

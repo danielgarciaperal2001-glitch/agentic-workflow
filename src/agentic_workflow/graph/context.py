@@ -108,20 +108,14 @@ class AgentContext:
 
     @property
     def signing_secret(self) -> str:
-        """Secret used to sign human decisions.
+        """Secret used to sign human decisions, or ``""`` when there is none.
 
-        Falls back to the API auth token so a deployment does not need a second
-        secret. When neither is configured, decisions are recorded unsigned and
-        the audit log records that fact explicitly.
+        Delegates to :meth:`Settings.resolved_signing_secret` so the resolution
+        and its fallback order live in one place. This used to be a second copy
+        of that logic, which is how the two drifted into disagreeing about which
+        secret to use.
         """
-        candidates = (self.settings.api_auth_token, self.settings.llm_api_key)
-        for candidate in candidates:
-            if candidate is None:
-                continue
-            value = candidate.get_secret_value()
-            if value:
-                return value
-        return ""
+        return self.settings.resolved_signing_secret()
 
 
 def context_from_runtime(runtime: Any) -> AgentContext:

@@ -186,6 +186,15 @@ def create_app(
             log.error("api.startup_failed", **resolved.safe_summary())
             raise
         log.info("api.ready", **resolved.safe_summary())
+        # Said here, and not in the engine, because this is a statement about a
+        # *deployment*: a control plane whose human decisions are unauthenticated
+        # and unsigned has an audit trail nobody can rely on, and the operator
+        # reading this log is the one who can fix it. The engine is a library and
+        # is also driven by `awf demo`, where the human at the keyboard is the
+        # trust boundary and the same warning would be noise.
+        signing_warning = resolved.signing_warning()
+        if signing_warning is not None:
+            log.warning("hitl.signatures_unavailable", detail=signing_warning)
         try:
             yield
         finally:

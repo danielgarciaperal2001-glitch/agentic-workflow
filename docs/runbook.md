@@ -212,6 +212,7 @@ Everything is `AWF_`-prefixed. The ones worth knowing by heart:
 | `AWF_LLM_API_KEY` | — | Required for a real provider. |
 | `AWF_HITL_ENABLED` | `true` | Master switch for human gates. |
 | `AWF_HITL_ESCALATION_THRESHOLD` | `0.70` | Confidence below which a human is asked. |
+| `AWF_HITL_SIGNING_SECRET` | — | Key that signs decisions. Falls back to `AWF_API_AUTH_TOKEN`. |
 | `AWF_MAX_ITERATIONS` | `6` | Feedback-loop budget before the run is escalated. |
 | `AWF_STATE_RETENTION_DAYS` | `30` | Retention window for the janitor. |
 | `AWF_API_RATE_LIMIT_PER_MINUTE` | `120` | Per-client request budget. |
@@ -243,3 +244,27 @@ The checkpoint store is the state. Everything else is derived:
 Back up PostgreSQL. If you back up nothing else, that is sufficient. Losing the
 signing secret is different — it does not lose decisions, but it makes them
 permanently unverifiable.
+
+### The audit signing secret
+
+Human decisions are signed with `AWF_HITL_SIGNING_SECRET`, falling back to
+`AWF_API_AUTH_TOKEN` when it is unset. Generate a dedicated one with
+`openssl rand -hex 32`.
+
+`AWF_LLM_API_KEY` is **not** used for this, deliberately. Rotating a provider
+credential at the provider's convenience would retroactively turn every
+signature ever written into an unverifiable one — indistinguishable, in the
+audit output, from a forged entry. If you are upgrading from a version that did
+use it, set a dedicated secret and treat pre-upgrade signatures as unverifiable
+from that point on; the decisions themselves are unaffected.
+
+When `AWF_HITL_REQUIRE_SIGNATURE` is on and neither secret is set, decisions are
+recorded **unsigned** and the API logs `hitl.signatures_unavailable` at boot.
+That is the default out of the box, so if you are reading this on a real
+deployment it is worth checking which of the three states you are in:
+
+- `audit_verified: true` on approval responses — signatures are being produced
+  and verified.
+- `audit_verified: null` — no secret is configured. Anyone with write access to
+  the database can alter the decision log undetectably.
+- Setting `AWF_HITL_REQUIRE_SIGNATURE=false` — the same gap, declared on purpose.

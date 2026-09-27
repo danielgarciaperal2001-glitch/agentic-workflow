@@ -120,6 +120,73 @@ class TestOverrides:
 class TestInvariants:
     """Cross-field rules that only hold because a validator enforces them."""
 
+    def test_the_llm_credential_is_never_a_decision_signing_key(self) -> None:
+        """A provider API key must not be the key that signs audit entries.
+
+        The audit trail's integrity depends on one secret staying put. An LLM
+        credential is a poor choice for that on every axis: it belongs to a third
+        party and can be rotated there without warning, at which point every
+        signature ever written verifies as a forgery; it is typically the most
+        widely distributed secret in the deployment, so the blast radius of
+        leaking it is every forged approval as well as provider access; and it
+        couples the audit log's integrity to whether an LLM is configured, so
+        the guarantee appears and disappears with an unrelated feature.
+
+        A deployment that needs signatures sets the dedicated secret.
+        """
+        settings = load_settings(llm_provider="openai", llm_api_key="awf-fake-key-1234")
+        assert settings.resolved_signing_secret() == ""
+
+    def test_a_dedicated_secret_is_preferred_over_the_api_token(self) -> None:
+        """The purpose-built secret wins, so the two concerns can rotate apart.
+
+        Sharing the API token is a reasonable convenience for a small deployment,
+        but it means rotating the credential that admits requests also
+        invalidates the audit history, and the two have very different blast
+        radii. When a dedicated secret exists it is the one that signs.
+        """
+        settings = load_settings(
+            api_auth_token="auth-token-value",
+            hitl_signing_secret="dedicated-signing-value",
+        )
+        assert settings.resolved_signing_secret() == "dedicated-signing-value"
+
+    def test_the_api_token_is_the_documented_fallback(self) -> None:
+        """With no dedicated secret, the API token keeps single-secret setups working."""
+        settings = load_settings(api_auth_token="auth-token-value")
+        assert settings.resolved_signing_secret() == "auth-token-value"
+
+    def test_an_unsigned_audit_trail_is_announced_at_boot(self) -> None:
+        """Promising signatures and not producing them must be loud, not silent.
+
+        ``hitl_require_signature`` defaults to true, but the default deployment
+        has no secret to sign with — the API is unauthenticated and the provider
+        is the offline echo. The promise was therefore skipped on every default
+        run with nothing said, and the setting's own description claimed the
+        signatures were written. An operator reading the config would conclude
+        the audit log was tamper-evident when it was not.
+        """
+        settings = load_settings(llm_provider="echo", api_auth_enabled=False)
+        assert settings.hitl_require_signature is True
+        assert settings.resolved_signing_secret() == ""
+        warning = settings.signing_warning()
+        assert warning is not None
+        # The message has to name the consequence and the remedy. A warning that
+        # only says "no secret" reads as noise and gets filtered out of a boot log.
+        rendered = warning.lower()
+        assert "unsigned" in rendered
+        assert "awf_hitl_signing_secret" in rendered
+
+    def test_a_configured_secret_raises_no_warning(self) -> None:
+        """Once a secret exists there is nothing to announce."""
+        settings = load_settings(hitl_signing_secret="dedicated-signing-value")
+        assert settings.signing_warning() is None
+
+    def test_signing_is_optional_and_silent_when_switched_off(self) -> None:
+        """Turning the requirement off is a legitimate choice, not a misconfiguration."""
+        settings = load_settings(hitl_require_signature=False)
+        assert settings.signing_warning() is None
+
     def test_production_refuses_an_evaluator_without_a_backend(self) -> None:
         """``deepeval`` in production is a supply-chain decision, not a default.
 

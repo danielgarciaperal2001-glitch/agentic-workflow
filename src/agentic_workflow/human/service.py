@@ -415,15 +415,14 @@ class ApprovalService:
 
     # -------------------------------------------------------- internals #
     def _signing_secret(self) -> str:
-        """Return the secret decisions are signed with, or ``""`` when unset."""
-        settings = self._engine.settings
-        for candidate in (settings.api_auth_token, settings.llm_api_key):
-            if candidate is None:
-                continue
-            value = candidate.get_secret_value()
-            if value:
-                return value
-        return ""
+        """Return the secret decisions are signed with, or ``""`` when unset.
+
+        Delegates to :meth:`Settings.resolved_signing_secret`. The duplicate
+        copy that used to live here is what allowed the service and the agent
+        context to disagree about the key, and therefore about whether a
+        decision was signed at all.
+        """
+        return self._engine.settings.resolved_signing_secret()
 
     def _to_view(
         self,
