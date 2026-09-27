@@ -26,10 +26,13 @@ help: ## Show this help
 # Environment
 # ---------------------------------------------------------------------------- #
 .PHONY: venv
+# `dev` already pulls in `api` and `postgres`: the conftest needs FastAPI and the
+# marked postgres tests need psycopg. Naming them here as well would let the two
+# lists drift apart.
 venv: ## Create the local virtualenv
 	python3 -m venv .venv
 	$(PIP) install --upgrade pip wheel
-	$(PIP) install -e ".[dev,api,postgres]"
+	$(PIP) install -e ".[dev]"
 
 .PHONY: install
 install: ## Install the project with all extras (editable)

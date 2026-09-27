@@ -92,7 +92,17 @@ obs = [
   "opentelemetry-instrumentation-httpx>=0.46b0",
 ]
 # Developer experience.
+# Pulls in the extras the test suite actually imports. `tests/conftest.py`
+# builds a `fastapi.testclient.TestClient` at module level and the marked
+# postgres tests import `psycopg`, so an extra that installs neither makes
+# `pip install -e ".[dev]"` produce an environment where *no* test in the
+# package can run — the collection dies on the conftest, not on a test.
+# A dev extra that cannot develop is a naming problem, not a preference.
+# `obs` is deliberately absent: observability is imported lazily and no test
+# touches it, so pulling in opentelemetry/prometheus would only slow the
+# `static` job down with packages it never executes.
 dev = [
+  "agentic-workflow[api,postgres]",
   "pytest>=8.2",
   "pytest-asyncio>=0.24",
   "pytest-cov>=5.0",
