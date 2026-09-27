@@ -79,7 +79,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.12", "3.13"]
+        # 3.11 is the floor `requires-python` declares, and the floor is where
+        # compatibility breaks: the code uses `StrEnum`, `typing.Self`,
+        # `asyncio.timeout` and `datetime.UTC`, so 3.11 is the oldest version
+        # it can actually run on, and an undeclared-but-unproven floor is a
+        # claim nobody has checked. 3.12 is what the Dockerfile ships, and 3.13
+        # is the newest the runner images offer as a stable pair.
+        python: ["3.11", "3.12", "3.13"]
         postgres: ["16"]
     services:
       postgres:
@@ -96,7 +102,17 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     env:
-      AWF_TEST_POSTGRES_DSN: postgresql://awf:awf@localhost:5432/awf_test
+      # The name has to be the one `Settings` reads. `AWF_TEST_POSTGRES_DSN`
+      # was a variable nobody read: settings fell back to its default DSN
+      # (`agentic:agentic@.../agentic`), the TCP probe in tests/conftest.py
+      # connected anyway because it never authenticates, and the suite then
+      # spent five minutes timing out against a role that does not exist.
+      AWF_POSTGRES_DSN: postgresql://awf:awf@localhost:5432/awf_test
+      AWF_POSTGRES_ENABLED: "true"
+      # Force the marker on rather than relying on the probe. If the service
+      # container is slow, a silent skip is the worse outcome: the job would
+      # go green having tested nothing.
+      AWF_TEST_POSTGRES: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -215,15 +231,19 @@ jobs:
 
   # --------------------------------------------------------------------------- #
   # The image. Built with buildx so the multi-stage Dockerfile is exercised
-  # rather than assumed; `load` is deliberately absent because the job only has
-  # to prove it builds.
+  # rather than assumed.
+  #
+  # `load: true` is load-bearing, and omitting it produced a failure that reads
+  # like a network problem: buildx leaves the result inside its own builder
+  # cache rather than the local daemon, so the `docker run` below finds no
+  # local image and tries to *pull* the tag from Docker Hub — which fails with
+  # `pull access denied` for a repository that was never published.
   # --------------------------------------------------------------------------- #
   docker:
     name: docker image
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -234,6 +254,7 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: agentic-workflow:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -249,10 +270,18 @@ jobs:
             agentic-workflow:${{ github.sha }}
 
           for attempt in $(seq 1 30); do
-            if curl -fsS http://localhost:8000/health/live; then
+            if curl -fs http://localhost:8000/health/live; then
               echo "\nimage is live"
               docker rm -f awf
               exit 0
+            fi
+            # A container that exits will never become healthy, and burning the
+            # whole budget on it reports "timed out" instead of the exit reason.
+            # The common cause is a settings error, which logs the real message.
+            if [ "$(docker inspect -f '{{.State.Running}}' awf)" != "true" ]; then
+              echo "The container exited before reporting healthy" >&2
+              docker logs awf 2>&1 | tail -50
+              exit 1
             fi
             echo "waiting for the API ($attempt/30)"
             docker logs awf 2>&1 | tail -5

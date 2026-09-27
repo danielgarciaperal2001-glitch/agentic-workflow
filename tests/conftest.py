@@ -62,29 +62,73 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     clean, honest "skipped" rather than a wall of connection errors — and CI,
     which *does* run PostgreSQL, still executes them.
 
+    ``AWF_TEST_POSTGRES=1`` overrides the probe in the *permissive* direction
+    only: it forces the tests to run even when nothing is listening, so a CI job
+    that was supposed to exercise PostgreSQL reports a real failure instead of
+    passing having silently tested nothing.
+
     Args:
         config: The pytest configuration object.
         items: The collected test items, mutated in place.
     """
-    if os.environ.get("AWF_TEST_POSTGRES") == "1" or _postgres_reachable():
+    if os.environ.get("AWF_TEST_POSTGRES") == "1" or _postgres_usable():
         return
-    skip = pytest.mark.skip(reason="no PostgreSQL reachable (set AWF_TEST_POSTGRES=1)")
+    skip = pytest.mark.skip(reason="no usable PostgreSQL (set AWF_TEST_POSTGRES=1 to force)")
     for item in items:
         if "postgres" in item.keywords:
             item.add_marker(skip)
 
 
-def _postgres_reachable() -> bool:
-    """Return whether the configured PostgreSQL accepts TCP connections.
+def _postgres_usable() -> bool:
+    """Return whether the configured DSN can actually be connected to.
+
+    Deciding this with a bare TCP probe is wrong in both directions, and both
+    are the failure this hook exists to prevent:
+
+    * A contributor who has *some* PostgreSQL on port 5432 — another project's,
+      or a Docker container they forgot about — passes a socket check for a DSN
+      whose credentials and database do not exist there. Every gated test then
+      fails on authentication, which is the wall of connection errors the skip
+      was supposed to prevent, just with a more confusing message.
+    * In CI, a service container whose ``initdb`` is still running accepts a TCP
+      connection before it can authenticate anyone. The socket check says yes,
+      the tests run, and the job fails intermittently depending on how fast the
+      runner is.
+
+    So: try a real connection first, and fall back to the socket probe only when
+    no driver is installed. The fallback still answers the question the default
+    install can answer, and it cannot do better than that.
 
     Returns:
-        ``True`` when a socket connects to the DSN's host and port within a
-        short timeout. A TCP probe rather than a full connection: it is fast,
-        needs no credentials, and is enough to decide whether to attempt the
-        marker-gated tests.
+        ``True`` when the DSN accepts an authenticated connection, or when no
+        driver is available and its host and port accept a TCP connection.
     """
-    settings = load_settings()
-    host, port = _host_port(settings.postgres_dsn)
+    dsn = load_settings().postgres_dsn
+    try:
+        import psycopg
+    except ImportError:
+        return _tcp_reachable(dsn)
+    try:
+        psycopg.connect(dsn, connect_timeout=3).close()
+    except Exception:
+        return False
+    return True
+
+
+def _tcp_reachable(dsn: str) -> bool:
+    """Return whether the DSN's host and port accept a TCP connection.
+
+    Only used when no PostgreSQL driver is installed, where a socket check is
+    the most the environment can tell us. It says nothing about the credentials,
+    which is exactly why it is the fallback and not the first choice.
+
+    Args:
+        dsn: A ``postgresql://user:pass@host:port/db`` string.
+
+    Returns:
+        ``True`` when a socket connects within a short timeout.
+    """
+    host, port = _host_port(dsn)
     if not host:
         return False
     try:
