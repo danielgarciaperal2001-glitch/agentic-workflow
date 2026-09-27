@@ -56,6 +56,7 @@ from agentic_workflow.domain.schemas import (
 )
 from agentic_workflow.domain.state import WorkflowState, as_model, as_models, initial_state
 from agentic_workflow.errors import (
+    ApprovalAlreadyResolvedError,
     ApprovalRejectedError,
     CheckpointNotFoundError,
     ConcurrencyLimitError,
@@ -483,6 +484,7 @@ class WorkflowEngine:
         Raises:
             RunNotFoundError: If the run is unknown.
             InvalidStateError: If the run is not parked on a human gate.
+            ApprovalAlreadyResolvedError: If this decision was already recorded.
         """
         outcome = await self.status(run_id)
         if not outcome.is_parked:
@@ -491,7 +493,48 @@ class WorkflowEngine:
                 run_id=run_id,
                 status=outcome.status,
             )
+        self._refuse_replayed_decision(outcome, decision)
         return await self._drive(None, context=context, resume=decision, run_id=run_id)
+
+    @staticmethod
+    def _refuse_replayed_decision(
+        outcome: RunOutcome, decision: ApprovalDecision | dict[str, Any]
+    ) -> None:
+        """Refuse a decision that this run has already recorded.
+
+        By the time a duplicate arrives the run has moved on to a different gate,
+        so the graph's id check fires and reports a mismatch. That is true and it
+        is the wrong answer: the client's decision was not stale, it was
+        *applied*, and the id check reports a mismatch between the pending gate
+        and a decision that was accepted when it was pending. A client reading
+        that concludes its approval expired and re-fetches the current gate —
+        which is how one approval turns into approval of the next gate too.
+
+        The decision log holds the answer, so the check is made against it and
+        the error names the real cause. The graph's check stays in place: it
+        still owns the question of whether a *new* decision belongs to the gate
+        the run is parked on, which is a different question.
+
+        Args:
+            outcome: The run as it stands, carrying its decision log.
+            decision: The decision being offered.
+
+        Raises:
+            ApprovalAlreadyResolvedError: If the approval was already answered.
+        """
+        approval_id = (
+            decision.approval_id
+            if isinstance(decision, ApprovalDecision)
+            else str(decision.get("approval_id", ""))
+        )
+        for entry in outcome.decisions:
+            if entry.get("approval_id") == approval_id:
+                raise ApprovalAlreadyResolvedError(
+                    "this decision was already recorded for the run",
+                    approval_id=approval_id,
+                    run_id=outcome.run_id,
+                    previous_decision=entry.get("decision"),
+                )
 
     async def run_until_done(
         self,

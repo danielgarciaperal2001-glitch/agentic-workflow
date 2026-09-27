@@ -28,6 +28,7 @@ import pytest
 from agentic_workflow.config import Settings
 from agentic_workflow.domain.schemas import Decision, ReviewRequest, Verdict
 from agentic_workflow.errors import (
+    ApprovalAlreadyResolvedError,
     CheckpointNotFoundError,
     ConcurrencyLimitError,
     InvalidStateError,
@@ -216,6 +217,31 @@ class TestResume:
         assert outcome.is_finished
         with pytest.raises(InvalidStateError):
             await engine.resume(outcome.run_id, _decide(outcome.pending))
+
+    async def test_a_decision_already_answered_is_refused_as_such(
+        self, engine: WorkflowEngine
+    ) -> None:
+        """Re-sending an answered decision says so, rather than blaming staleness.
+
+        The run has moved to a *different* gate by the time the duplicate
+        arrives, so the graph's id check fires and reports a mismatch. That is
+        true and useless: it reads as "your approval is out of date, go fetch the
+        current one and answer that instead", which is precisely the advice a
+        retrying client follows, and following it approves the next gate with
+        the intent meant for the previous one. The decision log already contains
+        the answer, so the engine says it contains it.
+        """
+        first = await engine.start(make_request())
+        answered = _decide(first.pending)
+        await engine.resume(first.run_id, answered)
+
+        with pytest.raises(ApprovalAlreadyResolvedError) as caught:
+            await engine.resume(first.run_id, answered)
+
+        assert caught.value.context["approval_id"] == answered["approval_id"]
+        assert caught.value.context["previous_decision"] == "approve"
+        # The refusal must leave the run exactly where the first decision left it.
+        assert (await engine.status(first.run_id)).is_parked is True
 
     async def test_run_until_done_converges(self, engine: WorkflowEngine) -> None:
         """Answering every gate terminates the run in a bounded number of steps.

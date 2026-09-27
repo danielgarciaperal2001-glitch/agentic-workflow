@@ -57,6 +57,24 @@ report. An edit is recorded as an edit, distinct from an approval of modified
 content — otherwise the audit log would say a human approved something they did
 not actually see.
 
+### Answering twice
+
+A duplicate submission is not an error condition to be tolerated; it is a
+decision someone already made being offered again, and the answer has to say so.
+`POST /v1/runs/{run_id}/resume` and `POST /v1/approvals/{approval_id}/resolve`
+both return `409 approval_already_resolved`, carrying the run id and the decision
+already on record.
+
+The distinction that matters is *already applied* versus *stale*. By the time a
+duplicate arrives the run has parked on a different gate, so an id comparison
+against the current gate reports a mismatch. That comparison is arithmetically
+true and practically wrong: the decision was not too old, it was accepted while
+it was current. A client told its approval expired fetches the new gate and
+answers that too, and one approval becomes two. The check is therefore made
+against the decision log, which holds the answer, and the graph's own
+stale-answer guard stays in place for the separate question of whether a *new*
+decision belongs to the gate the run is parked on.
+
 ### `reject`
 
 This is the one that is easy to get wrong.
