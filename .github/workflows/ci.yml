@@ -16,10 +16,17 @@ concurrency:
 permissions:
   contents: read
 
+# `PIP_NO_CACHE_DIR` is deliberately absent. It belongs in the Dockerfile, where
+# it keeps wheels out of the image layers and nothing is thrown away between
+# builds. Here it would be actively harmful: `setup-python` resolves
+# `cache: pip` by running `pip cache dir`, and with the cache disabled that
+# command exits 1 and the step fails before a single package is installed. A
+# runner is destroyed at the end of the job, so the disk the flag was meant to
+# protect is not a resource anyone reuses — and blocking it also stops pip from
+# ever populating the directory `cache: pip` exists to preserve.
 env:
   PYTHON_VERSION: "3.12"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  PIP_NO_CACHE_DIR: "1"
   FORCE_COLOR: "1"
 
 jobs:
@@ -125,7 +132,11 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,api,postgres]"
+          # `dev` alone is enough: it pulls in `api` and `postgres` itself,
+          # because the conftest imports `fastapi.testclient` at module level
+          # and the marked postgres tests import `psycopg`. Listing them here
+          # too would have hid the real reason the extras exist.
+          pip install -e ".[dev]"
 
       - name: Wait for PostgreSQL
         run: |
