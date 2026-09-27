@@ -188,7 +188,7 @@ the store is reachable.
 | Streaming | **WebSockets** | Per-run and broadcast event feeds with heartbeat and send timeout. |
 | Validation | **pydantic-settings** | Every setting is `AWF_`-prefixed, read once, and `lru_cache`d. |
 | Logging | **structlog** | JSON or console, one envelope, request/run correlation. |
-| Quality | **pytest**, **ruff**, **mypy --strict** | 388 tests; the strict typing is the point, not the coverage number. |
+| Quality | **pytest**, **ruff**, **mypy --strict** | 585 tests; the strict typing is the point, not the coverage number. |
 | Evals | Native metrics + **Ragas** / **DeepEval** (optional) | Deterministic by default; judges when you have credentials. |
 
 `src/` layout. Dependencies point one way: `domain/` imports nothing from the
@@ -222,24 +222,24 @@ machine, and the harness prints the CPU it ran on alongside every figure.
 
 | Measurement | Median | Mean | p95 | Min | Max | n |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `graph_compile` | 0.172 ms | 0.340 | 1.010 | 0.136 | 1.010 | 5 |
-| `end_to_end` | 67.107 ms | 69.638 | 86.814 | 55.330 | 86.814 | 15 |
-| `checkpoint_write` | 5.289 ms | 5.289 | 5.289 | 5.289 | 5.289 | 1 |
-| `end_to_end_5files` | 68.535 ms | 77.884 | 102.803 | 63.750 | 102.803 | 7 |
-| `end_to_end_20files` | 95.472 ms | 103.072 | 119.498 | 90.604 | 119.498 | 7 |
-| `gate_overhead` | 48.034 ms | 50.565 | 67.741 | 36.257 | 67.741 | 15 |
-| `throughput` | 15.512 runs/s | — | — | — | — | 1 |
-| `eval_suite` | 1.323 s | — | — | — | — | 1 |
+| `graph_compile` | 0.182 ms | 0.374 | 1.158 | 0.122 | 1.158 | 5 |
+| `end_to_end` | 66.970 ms | 66.644 | 82.096 | 55.423 | 82.096 | 15 |
+| `checkpoint_write` | 5.375 ms | 5.375 | 5.375 | 5.375 | 5.375 | 1 |
+| `end_to_end_5files` | 71.448 ms | 75.268 | 88.531 | 63.562 | 88.531 | 7 |
+| `end_to_end_20files` | 96.704 ms | 103.676 | 116.603 | 90.412 | 116.603 | 7 |
+| `gate_overhead` | 48.330 ms | 48.005 | 63.457 | 36.783 | 63.457 | 15 |
+| `throughput` | 15.293 runs/s | — | — | — | — | 1 |
+| `eval_suite` | 1.364 s | — | — | — | — | 1 |
 
 | Node | Median ms | Share of node time |
 | --- | ---: | ---: |
-| `reviewer` | 4.934 | 25.9% |
-| `reporter` | 4.826 | 25.3% |
-| `tester` | 4.398 | 23.1% |
-| `programmer` | 1.831 | 9.6% |
-| `triage` | 1.821 | 9.5% |
-| `apply_patch` | 0.900 | 4.7% |
-| `router` | 0.363 | 1.9% |
+| `reviewer` | 4.829 | 25.9% |
+| `reporter` | 4.827 | 25.9% |
+| `tester` | 3.936 | 21.1% |
+| `programmer` | 1.858 | 10.0% |
+| `triage` | 1.806 | 9.7% |
+| `apply_patch` | 0.965 | 5.2% |
+| `router` | 0.419 | 2.2% |
 
 Measured on CPython 3.14.7, AMD Athlon Silver 3050U, 2 CPUs, Linux
 7.2.7-200.fc44.x86_64.
@@ -380,10 +380,11 @@ make bench         # the tables above
 VS Code; it brings its own Docker-in-Docker so `docker compose` works inside it.
 
 CI runs four jobs: lint/format/mypy strict, the suite against a real PostgreSQL
-on two Python versions with a coverage floor, the golden dataset gated on the
-invariants, and a buildx build that then **boots the image** and waits for
-`/health/live` — a successful build and a bootable image are different claims and
-only the second is useful.
+on the three Python versions the package claims to support (3.11 is the
+`requires-python` floor, so the floor is the one that gets tested), the golden
+dataset gated on the invariants, and a buildx build that then **boots the image**
+and waits for `/health/live` — a successful build and a bootable image are
+different claims and only the second is useful.
 
 ## Configuration
 

@@ -67,6 +67,47 @@ the HTTP-only concerns like idempotency keys.
 because an implicit conversion is where a field gets renamed and the mismatch is
 discovered in production.
 
+### Retrying is a property of the error, declared by the error
+
+Every class in `errors.py` declares `retryable`, and `LLMClient.complete` reads
+that flag — not the exception's class name. The distinction is the whole point:
+
+A provider adapter is the only place that can tell a `503 overloaded` from a
+`401 invalid api key`, because only it can see the status code. It says so by
+constructing `ProviderHTTPError(..., retryable=True)` for the first and
+`retryable=False` for the second, and the retry loop, the exponential backoff and
+the `retryable` field an API client reads all follow from that one decision.
+
+Keying the loop off a hardcoded tuple of exception types instead looks equivalent
+and is not, in both directions at once. It cannot express "a 5xx is worth another
+attempt" for a type it was not told about, so a transient gateway failure kills
+the run on the first try; and it cannot express "this particular 401 is
+permanent" for a type it *was* told about, so a bad key is announced to the caller
+as retryable. Both were live here before the flag was honoured.
+
+The `retryable` kwarg is therefore *consumed* by `ProviderError.__init__` rather
+than left in the context dict. Left there it would be echoed into the error
+message — so the human-readable text said `retryable=False` while the
+machine-readable field said `true`, and a client that trusted either one was
+misled by half of the contract.
+
+### Redaction lives in the processor chain
+
+`logging.scrub()` masks values whose *key name* says they are credentials, and it
+is installed as a structlog processor rather than called at each log site. Both
+halves of that choice are load-bearing.
+
+In the chain, because the caller who forgets is exactly the case a redaction
+exists for. The one person who cannot be trusted to remember at 2am is whoever
+is writing an ad-hoc `log.info("...", config=settings.model_dump())`, and no
+amount of documentation in the module docstring fixes that.
+
+Walking sequences, because a payload carrying a list of files, findings or
+per-node results is an ordinary shape, not an exotic one. A walk that descended
+only into mappings left every secret inside a list reaching the log verbatim
+while redaction appeared to be working — which is worse than no redaction,
+because it is trusted.
+
 ## The graph
 
 Seven nodes. `awf topology` prints the live table; this is the shape.
