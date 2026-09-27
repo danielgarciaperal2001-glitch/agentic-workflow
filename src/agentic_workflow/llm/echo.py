@@ -89,8 +89,6 @@ _SECURITY_RULES: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
-_CODE_FENCE = re.compile(r"```(?P<lang>[\w+-]*)\n(?P<body>.*?)```", flags=re.DOTALL)
-
 #: A payload label is treated as a file path only if it looks like one. A
 #: description block is scanned by the rules but never cited, because
 #: attributing a finding to a file that does not exist is the exact hallucination
@@ -431,11 +429,6 @@ def _synthesise_findings(prompt: str) -> list[dict[str, Any]]:
             }
         )
     return out
-
-
-def _code_blocks(prompt: str) -> list[str]:
-    """Return the bodies of fenced code blocks in the prompt."""
-    return [m.group("body") for m in _CODE_FENCE.finditer(prompt)]
 
 
 def _approx_tokens(text: str) -> int:
