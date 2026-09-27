@@ -36,6 +36,8 @@ from agentic_workflow.errors import (
     RunNotFoundError,
     RunTimeoutError,
 )
+from agentic_workflow.graph.context import AgentContext
+from agentic_workflow.llm import EchoLLM
 from agentic_workflow.persistence.checkpointer import build_memory_checkpointer
 from agentic_workflow.services.engine import CheckpointInfo, RunOutcome, WorkflowEngine
 from tests.helpers import make_request, unique_run_id
@@ -925,6 +927,61 @@ class TestProviderResources:
         finally:
             await engine.cancel_all()
             await engine.shutdown()
+
+    async def test_shutdown_closes_the_client_the_engine_created(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A client the engine built is a client the engine must close.
+
+        Nothing called ``aclose`` on the API path, because ``shutdown`` closed
+        ``_context_template.llm`` and the API builds the engine without a
+        context, so that attribute was always ``None``. Every run leaked a
+        client's sockets and connection pool, and a long-lived process leaked
+        until it hit its file-descriptor limit — at which point the failures
+        arrive on unrelated work.
+
+        ``raising=False`` because the engine has no such call to patch until the
+        fix lands: the client is built by ``AgentContext.client``, not by the
+        engine. The test asserts the behaviour, not the import location.
+        """
+        spy = _SpyLLM(EchoLLM(model="echo-1"))
+        monkeypatch.setattr(
+            "agentic_workflow.services.engine.build_llm_client",
+            lambda _settings: spy,
+            raising=False,
+        )
+        engine = WorkflowEngine(
+            Settings(_env_file=None, llm_provider="echo", log_level="ERROR"),
+            checkpointer=build_memory_checkpointer(),
+        )
+        await engine.startup()
+        try:
+            await engine.start(make_request())
+        finally:
+            await engine.shutdown()
+
+        assert spy.closed == 1
+
+    async def test_shutdown_leaves_an_injected_client_alone(self) -> None:
+        """A client the caller supplied is the caller's to close.
+
+        The mirror image of the previous test, and the direction that is easy to
+        get wrong while fixing the other one. The engine cannot know whether a
+        caller intends to reuse a context across engines — a shared fixture, an
+        in-process demo, a test — and closing it out from under them would be a
+        surprise with no local explanation.
+        """
+        shared = Settings(_env_file=None, llm_provider="echo", log_level="ERROR")
+        inner = _SpyLLM(EchoLLM(model="echo-1"))
+        engine = WorkflowEngine(
+            shared,
+            checkpointer=build_memory_checkpointer(),
+            context=AgentContext(settings=shared, llm=inner),
+        )
+        await engine.startup()
+        await engine.shutdown()
+
+        assert inner.closed == 0
 
 
 class TestOutcome:

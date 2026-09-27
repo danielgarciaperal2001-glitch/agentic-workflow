@@ -422,10 +422,16 @@ class WorkflowEngine:
             if close is not None:
                 with suppress(Exception):
                     await close()
-        llm = self._context_template.llm if self._context_template else None
-        if llm is not None and hasattr(llm, "aclose"):
-            with suppress(Exception):
-                await llm.aclose()
+        # Only the client this engine built. A client handed in through a context
+        # belongs to whoever passed it: closing it here would break a caller that
+        # reuses one context across engines, with no error to explain why.
+        if self._llm is not None:
+            close_llm = getattr(self._llm, "aclose", None)
+            if close_llm is not None:
+                with suppress(Exception):
+                    await close_llm()
+            # Dropped so a restarted engine cannot hand out a closed client.
+            self._llm = None
         self._started = False
         log.info("engine.stopped")
 
