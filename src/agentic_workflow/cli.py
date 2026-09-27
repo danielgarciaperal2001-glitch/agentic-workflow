@@ -511,8 +511,15 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
         _echo(f"error: the evals package is not importable: {exc}", file=sys.stderr)
         return BAD_INPUT
 
+    from agentic_workflow.config import load_settings
+
+    # The flag wins so a one-off run needs no config edit; the setting is the
+    # default so a deployment that grades its own dataset is configured once.
+    # Passing ``None`` would silently fall back to the bundled golden set.
+    dataset = args.dataset or load_settings().eval_dataset_path
+
     report = await run_suite(
-        dataset=args.dataset,
+        dataset=dataset,
         provider=args.provider,
         limit=args.limit,
         memory=True,
@@ -720,7 +727,10 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--dataset",
         default=None,
-        help="Path to a JSONL dataset (default: the bundled golden set).",
+        help=(
+            "Path to a JSONL dataset. Defaults to AWF_EVAL_DATASET_PATH, so a "
+            "deployment that grades against its own set needs no flag."
+        ),
     )
     evaluate.add_argument("--limit", type=int, default=None, help="Only the first N cases.")
     evaluate.add_argument(

@@ -162,12 +162,6 @@ class Settings(BaseSettings):
         default=LogFormat.CONSOLE,
         description="Renderer for structured logs (`json` for aggregators).",
     )
-    log_sample_rate: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=1.0,
-        description="Ratio of DEBUG records sampled in non-development environments.",
-    )
     service_name: str = Field(
         default="agentic-workflow",
         min_length=1,
@@ -313,10 +307,13 @@ class Settings(BaseSettings):
     postgres_sslmode: str = Field(default="prefer", min_length=1)
 
     # ---------------------------------------------------------------- api #
-    # Binding to every interface is the correct default for a container: the
-    # service is not reachable from outside the compose network otherwise.
-    api_host: str = Field(default="0.0.0.0", min_length=1)  # noqa: S104
-    api_port: int = Field(default=8000, ge=1, le=65535)
+    # The bind address is deliberately absent. This service is an ASGI
+    # application: `uvicorn agentic_workflow.api.app:create_app` is the entrypoint
+    # (see the Dockerfile), and it reads `--host`/`--port` from its own command
+    # line before any application code runs. A setting here could not take
+    # effect, and the container's exposed port is already parameterised by
+    # `AWF_API_PORT` in `docker-compose.yml` — on the compose side, where it
+    # belongs.
     api_root_path: str = Field(
         default="",
         description="ASGI root path when served behind a reverse proxy.",
@@ -334,10 +331,6 @@ class Settings(BaseSettings):
         description="Bearer token accepted when `api_auth_enabled` is true.",
     )
     api_rate_limit_per_minute: int = Field(default=120, ge=0)
-    api_embedded_worker: bool = Field(
-        default=True,
-        description="Execute runs in-process. Disable to scale the API separately.",
-    )
     api_docs_enabled: bool = Field(
         default=True,
         description="Expose OpenAPI docs. Force off in production.",
@@ -438,24 +431,14 @@ class Settings(BaseSettings):
 
     # -------------------------------------------------------------- eval  #
     eval_provider: EvalProvider = Field(default=EvalProvider.NATIVE)
-    eval_judge_model: str = Field(default="gpt-4o-mini", min_length=1)
     eval_dataset_path: str = Field(
         default="evals/datasets/pr_review_golden.jsonl",
         min_length=1,
+        description=(
+            "JSONL dataset `awf eval` grades against when `--dataset` is not "
+            "given. The flag still wins, so a one-off run needs no config edit."
+        ),
     )
-    eval_faithfulness_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
-    eval_relevancy_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
-    eval_answer_recall_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
-    eval_context_precision_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
-    eval_fail_under_threshold: bool = Field(
-        default=True,
-        description="Fail the evaluation suite when a metric drops below its floor.",
-    )
-
-    # ------------------------------------------------------ integrations  #
-    langsmith_tracing: bool = Field(default=False)
-    langsmith_project: str = Field(default="agentic-workflow", min_length=1)
-    langsmith_api_key: SecretStr | None = Field(default=None)
 
     # ---------------------------------------------------------- validators #
     @model_validator(mode="after")
