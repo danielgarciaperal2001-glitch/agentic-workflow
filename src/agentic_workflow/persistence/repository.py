@@ -25,7 +25,6 @@ change, and the checkpoint store already provides the durable audit trail.
 
 from __future__ import annotations
 
-import asyncio
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -185,6 +184,18 @@ class RunRecord:
 class RunRegistry:
     """Bounded, concurrency-safe, in-process registry of runs.
 
+    Safe against concurrent runs because every method here is synchronous: a
+    synchronous body contains no await point, so asyncio cannot interleave two
+    of them, and a check-then-write such as :meth:`create` cannot be observed
+    half-done. A lock would not have been the guarantee even if it were
+    acquirable — awaiting one from synchronous code blocks the loop, and this
+    registry is read from request handlers on that same loop.
+
+    What the lock *could* not cover anyway is the multi-step sequences built on
+    it, such as admitting a run under the engine's per-run guard. Those are
+    serialised by ``WorkflowEngine._lock`` at the level where the invariant is
+    actually stated.
+
     Args:
         max_entries: Hard cap on retained runs. The least recently updated run is
             evicted once the cap is reached, which bounds memory without needing
@@ -204,7 +215,6 @@ class RunRegistry:
         self._max_entries = max(1, max_entries)
         self._ttl_seconds = ttl_seconds
         self._runs: OrderedDict[str, RunRecord] = OrderedDict()
-        self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------- writes #
     def create(
