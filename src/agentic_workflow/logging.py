@@ -57,6 +57,8 @@ def configure_logging(settings: Settings | None = None, *, force: bool = False) 
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
+        # Before the renderers, so nothing reaches stdout or stderr unredacted.
+        _redacting_processor,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.UnicodeDecoder(),
@@ -160,19 +162,13 @@ def current_context() -> dict[str, Any]:
     return dict(ctx)
 
 
-def scrub(
-    payload: Mapping[str, Any], *, redact_keys: frozenset[str] | None = None
-) -> dict[str, Any]:
-    """Redact secret-looking keys from a mapping before logging it.
-
-    Args:
-        payload: Arbitrary log payload.
-        redact_keys: Extra keys to mask. Defaults to common secret names.
-
-    Returns:
-        A copy with sensitive values replaced by ``***``.
-    """
-    defaults = {
+#: Key names whose values are replaced by ``***`` before anything is rendered.
+#: Name-based rather than value-based on purpose: a value-based rule cannot
+#: distinguish a credential from a benign string that happens to look like one,
+#: so it either leaks or over-masks, and both are worse than asking the key to
+#: declare itself.
+_DEFAULT_REDACT_KEYS: frozenset[str] = frozenset(
+    {
         "api_key",
         "apikey",
         "authorization",
@@ -182,16 +178,59 @@ def scrub(
         "token",
         "llm_api_key",
     }
-    keys = frozenset(defaults | frozenset(redact_keys or frozenset()))
+)
+
+
+def _scrub_value(value: Any, keys: frozenset[str]) -> Any:
+    """Redact a single value, recursing through mappings and sequences.
+
+    Sequences matter as much as mappings here. A log event carrying a list of
+    files, findings or per-node results is an ordinary shape, and walking only
+    mappings let every secret inside those lists reach the log verbatim — the
+    redaction appeared to work, which is the worst outcome available.
+    """
+    if isinstance(value, Mapping):
+        return scrub(value, redact_keys=keys)
+    if isinstance(value, list | tuple | set):
+        return type(value)(_scrub_value(item, keys) for item in value)
+    return value
+
+
+def scrub(
+    payload: Mapping[str, Any], *, redact_keys: frozenset[str] | None = None
+) -> dict[str, Any]:
+    """Redact secret-looking keys from a mapping before logging it.
+
+    Walks nested mappings and sequences. Matching is on the key name, case
+    insensitively, so a value is only redacted when its *name* says it is a
+    credential; ordinary diagnostics keep every field.
+
+    Args:
+        payload: Arbitrary log payload.
+        redact_keys: Extra keys to mask. Defaults to common secret names.
+
+    Returns:
+        A copy with sensitive values replaced by ``***``.
+    """
+    keys = frozenset(_DEFAULT_REDACT_KEYS | frozenset(redact_keys or frozenset()))
     out: dict[str, Any] = {}
     for key, value in payload.items():
         if key.lower() in keys:
             out[key] = "***"
-        elif isinstance(value, Mapping):
-            out[key] = scrub(value, redact_keys=keys)
         else:
-            out[key] = value
+            out[key] = _scrub_value(value, keys)
     return out
+
+
+def _redacting_processor(_logger: Any, _name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """structlog processor that scrubs every event before it is rendered.
+
+    The redaction has to live in the processor chain rather than at each call
+    site: a caller who forgets is exactly the case a redaction exists for, and
+    the one caller that cannot be trusted to remember is the one writing an
+    ad-hoc ``log.info("...", config=settings.model_dump())`` at 2am.
+    """
+    return scrub(event_dict)
 
 
 __all__ = [
