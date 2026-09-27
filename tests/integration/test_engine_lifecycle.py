@@ -858,6 +858,75 @@ class TestGraphBackstop:
             await engine.shutdown()
 
 
+class _SpyLLM:
+    """A client that reports being closed, delegating everything else.
+
+    Args:
+        inner: The real client to forward to.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.closed = 0
+
+    async def aclose(self) -> None:
+        """Record the close and forward it.
+
+        Returns:
+            Nothing.
+        """
+        self.closed += 1
+        await self._inner.aclose()
+
+    def __getattr__(self, name: str) -> Any:
+        """Forward every other attribute to the wrapped client.
+
+        Args:
+            name: Attribute name.
+
+        Returns:
+            Whatever the wrapped client returns.
+        """
+        return getattr(self._inner, name)
+
+
+class TestProviderResources:
+    """The LLM client is a process resource, not a per-run one.
+
+    The client owns the connection pool and the semaphore that bounds how many
+    requests reach the provider at once. Everything here follows from that: one
+    client per process, and closed exactly once by whoever created it.
+    """
+
+    async def test_two_runs_share_one_client(self) -> None:
+        """The concurrency ceiling is per process, so the client cannot be per run.
+
+        ``llm_max_concurrency`` reads like a deployment-wide promise, and on the
+        API path it was not one. The engine built a fresh ``AgentContext`` per
+        run, each of which lazily built its own client, and each client built
+        its own semaphore from the same setting. Eight concurrent runs with
+        ``llm_max_concurrency=8`` therefore put sixty-four requests in flight
+        against a provider the configuration says is allowed eight — and a
+        provider's rate limiter answers that with 429s, not with a queue.
+
+        The ceiling is the thing being tested: one client means one semaphore.
+        """
+        engine = WorkflowEngine(
+            Settings(_env_file=None, llm_provider="echo", log_level="ERROR"),
+            checkpointer=build_memory_checkpointer(),
+        )
+        await engine.startup()
+        try:
+            first = engine._context_for(None, "run-a")
+            second = engine._context_for(None, "run-b")
+
+            assert first is not second, "each run needs its own sink to attribute events"
+            assert first.client is second.client
+        finally:
+            await engine.cancel_all()
+            await engine.shutdown()
+
+
 class TestOutcome:
     """The value object every caller receives."""
 

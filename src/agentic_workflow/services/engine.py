@@ -75,6 +75,7 @@ from agentic_workflow.graph.runtime import (
     thread_config,
 )
 from agentic_workflow.human.gates import decode_interrupt
+from agentic_workflow.llm.base import build_llm_client
 from agentic_workflow.logging import bind_context, get_logger
 from agentic_workflow.persistence.checkpointer import build_checkpointer
 from agentic_workflow.persistence.repository import RunRegistry, RunStatus
@@ -265,6 +266,7 @@ class WorkflowEngine:
         self._graph = graph
         self._context_template = context
         self._event_sink = event_sink
+        self._llm: Any = None
         self._running: dict[str, asyncio.Task[list[ApprovalRequest]]] = {}
         self._cancelled: set[str] = set()
         self._started = False
@@ -817,15 +819,61 @@ class WorkflowEngine:
         A per-run context is the point: a single global event sink serves many
         runs, and every event it receives has to be attributable. Copying the
         template keeps the run id out of the shared object.
+
+        Every path through here ends up with the same LLM client, which is what
+        makes the provider concurrency ceiling mean what the setting says.
         """
         if context is not None:
-            return context
+            return self._bind_client(context)
         template = self._context_template
         if template is None:
-            return AgentContext(settings=self._settings, emit=self._event_sink)
+            return AgentContext(
+                settings=self._settings,
+                llm=self._shared_llm(),
+                emit=self._event_sink,
+            )
         if self._event_sink is None or template.emit is not None:
-            return template
-        return replace(template, emit=self._scoped_sink(run_id))
+            return self._bind_client(template)
+        return self._bind_client(replace(template, emit=self._scoped_sink(run_id)))
+
+    def _bind_client(self, context: AgentContext) -> AgentContext:
+        """Return *context* carrying the process-wide client when it has none.
+
+        A client the caller supplied is left exactly as it is: the engine does
+        not own it, so it must neither replace it nor close it at shutdown.
+        A context arriving without one gets the engine's, because leaving it
+        unset would let the lazy accessor build a private client per run and
+        silently multiply the configured ceiling.
+
+        Args:
+            context: A context that may or may not already carry a client.
+
+        Returns:
+            The same context, or a copy of it with the client filled in. The
+            caller's object is never mutated.
+        """
+        if context.llm is not None:
+            return context
+        return replace(context, llm=self._shared_llm())
+
+    def _shared_llm(self) -> Any:
+        """Return the process-wide LLM client, building it on first use.
+
+        One client per engine, not per run. The client owns the connection pool
+        and the semaphore that bounds how many requests reach the provider at
+        once, so a client per run would multiply ``llm_max_concurrency`` by the
+        number of runs in flight: eight runs configured for eight in parallel
+        would open sixty-four. The provider answers that with rate-limit errors
+        rather than with a queue.
+
+        Built lazily rather than in the constructor so that merely constructing
+        an engine does not open sockets, and so the client is only created on
+        the code path that actually needs one.
+        """
+        if self._llm is None:
+            self._llm = build_llm_client(self._settings)
+            log.info("llm.initialised", provider=self._settings.llm_provider.value)
+        return self._llm
 
     async def _drive(
         self,
