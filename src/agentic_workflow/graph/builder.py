@@ -69,24 +69,6 @@ GraphT = TypeVar("GraphT")
 _ROUTABLE: frozenset[str] = frozenset({TRIAGE, PROGRAMMER, REVIEWER, TESTER, REPORTER, APPLY_PATCH})
 
 
-#: LangGraph recursion limit: derived from the iteration budget with headroom
-#: for triage, review, test, apply and report hops.
-def _recursion_limit(settings: Settings) -> int:
-    """Compute the Pregel recursion limit for *settings*.
-
-    One loop costs roughly five super-steps (programmer, reviewer, router,
-    tester, router). The budget is doubled for the resume path, where every node
-    in the loop is re-executed after a Human-in-the-Loop interrupt.
-
-    Args:
-        settings: Application configuration.
-
-    Returns:
-        A safe upper bound on super-steps for a single ``ainvoke``.
-    """
-    return 25 + 10 * settings.max_iterations
-
-
 def build_graph(
     settings: Settings | None = None,
     *,

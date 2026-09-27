@@ -25,6 +25,39 @@ THREAD_ID = "thread_id"
 
 StreamMode = Literal["values", "updates", "debug", "tasks", "messages"]
 
+#: Super-steps consumed before the first repair loop begins: triage, programmer,
+#: reviewer, router, tester, reporter.
+_BASE_SUPER_STEPS = 25
+
+#: Super-steps one repair loop costs: programmer, reviewer, router, tester, router.
+_SUPER_STEPS_PER_ITERATION = 10
+
+
+def recursion_limit_for(settings: Settings | None = None) -> int:
+    """Compute the Pregel recursion limit for *settings*.
+
+    This is the graph's own backstop, and it has to clear the iteration budget
+    the router enforces on business grounds. The two are not alternatives: the
+    router decides a run needs a human, while this decides the process has a
+    runaway graph on its hands. When only the second is available the run dies
+    of infrastructure exhaustion instead of of an exhausted allowance, and the
+    operator learns nothing about which budget was spent.
+
+    The margin is generous because the cost per loop is an estimate, not a
+    constant. One iteration re-enters the programmer, the reviewer, the router,
+    the tester and the router again; an interrupt re-executes the gated node
+    from the top, so the resume path is the more expensive one. Over-provisioning
+    costs nothing — the limit only ever fires on a graph that is not converging.
+
+    Args:
+        settings: Application configuration. Defaults to the process settings.
+
+    Returns:
+        A safe upper bound on super-steps for a single ``ainvoke``.
+    """
+    resolved = settings or load_settings()
+    return _BASE_SUPER_STEPS + _SUPER_STEPS_PER_ITERATION * resolved.max_iterations
+
 
 def create_run_config(
     thread_id: str,
@@ -74,7 +107,7 @@ def create_run_config(
             "configurable": configurable,
             "recursion_limit": recursion_limit
             if recursion_limit is not None
-            else 25 + 10 * settings.max_iterations,
+            else recursion_limit_for(settings),
             "max_concurrency": settings.max_parallel_runs,
             "tags": ["agentic-workflow", f"thread:{thread_id}"],
             "metadata": {"run_id": run_id or thread_id, "thread_id": thread_id},
@@ -172,5 +205,6 @@ __all__ = [
     "create_run_config",
     "extract_interrupts",
     "is_interrupted",
+    "recursion_limit_for",
     "thread_config",
 ]
