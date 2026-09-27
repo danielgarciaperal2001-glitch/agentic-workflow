@@ -95,7 +95,10 @@ def node(
             with bind_context(run_id=run_id, node=name):
                 try:
                     update = await _with_timeout(
-                        func(state, runtime), name, run_id, timeout_seconds
+                        func(state, runtime),
+                        name,
+                        run_id,
+                        _budget(timeout_seconds, runtime),
                     )
                 except BaseException as exc:
                     if isinstance(exc, asyncio.CancelledError):
@@ -138,6 +141,34 @@ def node(
     return decorator
 
 
+def _budget(timeout_seconds: float | None, runtime: Any) -> float:
+    """Resolve the per-node budget for one invocation.
+
+    An explicit ``timeout_seconds`` on the decorator always wins. Otherwise the
+    configured ``node_timeout_seconds`` applies, which is the fallback
+    :func:`node` has always documented.
+
+    The lookup happens per call, not when the module is imported, because
+    :func:`node` is applied as a decorator at import time: reading the settings
+    there would bind every node in the process to whatever was configured when
+    the module loaded, and the setting would be unreachable for any caller that
+    constructed its own ``Settings`` — which is every embedding application and
+    every test.
+
+    Args:
+        timeout_seconds: The budget given to the decorator, if any.
+        runtime: The ``Runtime`` LangGraph passes to the node, or ``None``.
+
+    Returns:
+        The budget in seconds.
+    """
+    if timeout_seconds is not None:
+        return timeout_seconds
+    from agentic_workflow.graph.context import context_from_runtime
+
+    return context_from_runtime(runtime).settings.node_timeout_seconds
+
+
 async def _with_timeout(
     awaitable: Awaitable[dict[str, Any]],
     name: str,
@@ -148,10 +179,23 @@ async def _with_timeout(
 
     Uses :func:`asyncio.timeout` so a timeout cancels the inner work cleanly,
     letting the checkpointer roll the task back instead of leaving orphans
-    behind. An *external* cancellation is re-raised untouched, because
-    ``asyncio.timeout`` surfaces a deadline as ``TimeoutError`` and a
-    ``Task.cancel()`` as ``CancelledError`` — conflating them would let an
-    operator's cancel be reported as a node timeout.
+    behind.
+
+    An *external* cancellation is re-raised untouched, and it needs no help to
+    happen: a deadline surfaces as ``TimeoutError`` and ``Task.cancel()`` as
+    ``CancelledError``, so catching only the former already lets the latter
+    through. When both race, ``asyncio.timeout`` prefers the external
+    cancellation and propagates ``CancelledError``.
+
+    There used to be a guard here that re-raised whenever the ``TimeoutError``
+    carried a ``CancelledError`` in its ``__cause__``, on the theory that such an
+    error came from outside. It does not: since 3.11 ``asyncio.timeout`` sets
+    that ``__cause__`` on the deadlines it raises itself, so the guard fired on
+    every real timeout, discarded the ``RunTimeoutError`` it had just built, and
+    handed a bare ``TimeoutError`` to the node wrapper — which reports it as a
+    generic ``AgentError``. The budget was therefore enforced but invisible: no
+    run id, no node name, and a 504-shaped failure that reads as a malfunction
+    rather than as the ceiling being reached.
     """
     if not timeout_seconds or timeout_seconds <= 0:
         return await awaitable
@@ -160,10 +204,6 @@ async def _with_timeout(
         async with asyncio.timeout(timeout_seconds):
             return await awaitable
     except TimeoutError as exc:
-        if isinstance(exc.__cause__, asyncio.CancelledError):
-            # `asyncio.timeout` re-raises a cancelled inner task as `TimeoutError`
-            # on some paths; a deadline we did not set must not become a timeout.
-            raise
         raise RunTimeoutError(
             f"node {name!r} exceeded its {timeout_seconds:.0f}s budget",
             run_id=run_id,

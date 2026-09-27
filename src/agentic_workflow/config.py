@@ -192,7 +192,11 @@ class Settings(BaseSettings):
         default=120.0,
         gt=0.0,
         le=3600.0,
-        description="Per-node wall-clock budget enforced by the run manager.",
+        description=(
+            "Per-node wall-clock budget, enforced by the `@node` wrapper. A node "
+            "exceeding it fails its run with `RunTimeoutError` rather than "
+            "holding a concurrency slot until the run deadline."
+        ),
     )
     run_timeout_seconds: float = Field(
         default=900.0,
