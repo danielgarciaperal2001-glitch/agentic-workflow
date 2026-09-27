@@ -22,6 +22,7 @@ import asyncio
 from contextlib import suppress
 from typing import Any
 
+from langgraph.errors import GraphRecursionError
 import pytest
 
 from agentic_workflow.config import Settings
@@ -30,6 +31,7 @@ from agentic_workflow.errors import (
     CheckpointNotFoundError,
     ConcurrencyLimitError,
     InvalidStateError,
+    IterationLimitExceededError,
     RunAlreadyExistsError,
     RunNotFoundError,
     RunTimeoutError,
@@ -803,6 +805,54 @@ class TestConcurrency:
         try:
             outcome = await asyncio.wait_for(engine.start(make_request()), timeout=30)
             assert outcome.status in {"waiting_human", "completed", "failed"}
+        finally:
+            await engine.cancel_all()
+            await engine.shutdown()
+
+
+class _RunawayGraph:
+    """A graph stand-in that trips LangGraph's own recursion backstop.
+
+    The engine takes a pre-compiled graph precisely so a test can substitute one
+    that misbehaves in a way no real graph would.
+    """
+
+    async def astream(self, *args: Any, **kwargs: Any) -> Any:
+        """Raise the moment the graph is iterated, as a cyclic graph eventually does."""
+        raise GraphRecursionError("Recursion limit of 25 reached without a Next or END step")
+        yield {}  # pragma: no cover - unreachable, makes this an async generator
+
+
+class TestGraphBackstop:
+    """What happens when the graph's own limit trips before the router's budget."""
+
+    async def test_recursion_is_reported_as_budget_exhaustion(self) -> None:
+        """A runaway loop is an exhausted allowance, not an infrastructure fault.
+
+        LangGraph's recursion limit is the last backstop under the router's
+        iteration budget. When it trips, the run genuinely spent what it was
+        allowed and the answer is "this needs a human" — 422, with a code the
+        client can branch on. Left unhandled it fell through to the generic
+        handler and surfaced as a 500, which reads as a bug in the deployment
+        and pages someone. It is a decision, not a fault.
+        """
+        engine = WorkflowEngine(
+            Settings(_env_file=None, llm_provider="echo", log_level="ERROR"),
+            checkpointer=build_memory_checkpointer(),
+            graph=_RunawayGraph(),
+        )
+        await engine.startup()
+        try:
+            with pytest.raises(IterationLimitExceededError) as caught:
+                await engine.start(make_request())
+
+            assert "recursion limit" in str(caught.value)
+            # The failure has to be readable afterwards: a run that dies this way
+            # with nothing but a stack trace is a run nobody can look up. The
+            # registry is checked rather than `status()` because a graph that
+            # trips its limit on the first step never writes a checkpoint.
+            recorded = {s.run_id: s for s in await engine.list_runs(limit=10)}
+            assert recorded[caught.value.run_id].status == "failed"
         finally:
             await engine.cancel_all()
             await engine.shutdown()

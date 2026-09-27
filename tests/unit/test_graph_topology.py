@@ -456,6 +456,51 @@ class TestRouterInvariants:
         assert decision.target is Route.PROGRAMMER
         assert decision.exhausted is False
 
+    @pytest.mark.parametrize(
+        ("verdict", "tests"),
+        [
+            pytest.param(
+                "approved", {"passed": False, "total": 4, "failed": 2}, id="approved-failing-tests"
+            ),
+            pytest.param(
+                "changes_requested",
+                {"passed": False, "total": 4, "failed": 2},
+                id="changes-failing-tests",
+            ),
+            pytest.param("changes_requested", None, id="changes-no-tests"),
+        ],
+    )
+    def test_no_repair_loop_outlives_the_budget(
+        self, verdict: str, tests: dict[str, Any] | None
+    ) -> None:
+        """Every route back to the programmer obeys the iteration budget.
+
+        The budget used to be checked in a single branch, below the branches that
+        decide to loop. That made it reachable only when the review asked for
+        changes *and* the tests happened to pass — so the two most common repair
+        paths, a failing suite under either verdict, ignored it entirely and
+        asked for another attempt forever. Nothing stopped them but LangGraph's
+        recursion limit, which surfaces as an infrastructure error rather than as
+        the business outcome it is: this run ran out of budget.
+
+        Each repair path is listed separately because the check has to be shared
+        by all of them. Guarding one branch would leave the others unbounded, and
+        a budget that depends on *why* the work is looping is not a budget.
+        """
+        decision = decide_route(
+            self._state(
+                task_brief={"objective": "fix drift"},
+                patch=self._patch(),
+                review={"verdict": verdict, "findings": []},
+                test_report=tests,
+                iteration=3,
+            ),
+            max_iterations=3,
+        )
+        assert decision.target is Route.REPORTER
+        assert decision.exhausted is True
+        assert decision.escalate is True
+
     def test_empty_patch_is_reported_rather_than_applied(self) -> None:
         """An approved but empty patch produces a report instead of a no-op write.
 

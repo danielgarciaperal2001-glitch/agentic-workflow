@@ -138,8 +138,9 @@ def decide_route(state: WorkflowState, *, max_iterations: int = 6) -> RoutingDec
                 Route.TESTER, "review approved; validating the change before applying it"
             )
         if not tests.passed:
-            return RoutingDecision(
-                Route.PROGRAMMER,
+            return _repair_or_escalate(
+                iteration,
+                max_iterations,
                 f"approved but validation failed ({tests.failed} test(s)); repairing",
                 escalate=tests.failed > 3,
             )
@@ -159,12 +160,50 @@ def decide_route(state: WorkflowState, *, max_iterations: int = 6) -> RoutingDec
 
     # --- feedback path: verdict is changes_requested / needs_human -------- #
     if tests is not None and not tests.passed:
-        return RoutingDecision(
-            Route.PROGRAMMER,
+        return _repair_or_escalate(
+            iteration,
+            max_iterations,
             f"validation failed ({tests.failed} test(s)); returning to the patch author",
             escalate=tests.failed > 3,
         )
 
+    return _repair_or_escalate(
+        iteration,
+        max_iterations,
+        f"review requested changes ({review.blocking_count} blocking); iteration {iteration + 1}",
+        escalate=review.confidence < 0.5,
+    )
+
+
+def _repair_or_escalate(
+    iteration: int,
+    max_iterations: int,
+    reason: str,
+    *,
+    escalate: bool,
+) -> RoutingDecision:
+    """Hand the work back to the patch author, unless the budget is spent.
+
+    Every decision that routes to the programmer goes through here, and the
+    budget lives here rather than in any one branch. That placement is the whole
+    point: the three repair paths are reached by different conditions, so a check
+    inside a single branch of :func:`decide_route` is only consulted when that
+    branch's condition happens to hold. A failing test suite is the most common
+    repair of all, and it is exactly the one that used to loop without end.
+
+    A run with no iterations left stops and escalates instead. Continuing would
+    spend money on a repair the configuration has already declined to buy, and
+    the operator is the one who can decide whether to grant more.
+
+    Args:
+        iteration: Completed repair loops so far.
+        max_iterations: The configured ceiling.
+        reason: Why the work is going back, recorded in the transcript.
+        escalate: Whether to flag the loop for human attention.
+
+    Returns:
+        A route to the programmer, or a terminal report when out of budget.
+    """
     if iteration >= max_iterations:
         return RoutingDecision(
             Route.REPORTER,
@@ -173,12 +212,7 @@ def decide_route(state: WorkflowState, *, max_iterations: int = 6) -> RoutingDec
             escalate=True,
             exhausted=True,
         )
-
-    return RoutingDecision(
-        Route.PROGRAMMER,
-        f"review requested changes ({review.blocking_count} blocking); iteration {iteration + 1}",
-        escalate=review.confidence < 0.5,
-    )
+    return RoutingDecision(Route.PROGRAMMER, reason, escalate=escalate)
 
 
 @node(ROUTER)

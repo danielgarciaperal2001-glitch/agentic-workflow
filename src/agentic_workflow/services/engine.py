@@ -41,6 +41,7 @@ import inspect
 from typing import Any, Final, cast, get_args
 
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 
 from agentic_workflow.config import Settings, load_settings
@@ -59,6 +60,7 @@ from agentic_workflow.errors import (
     CheckpointNotFoundError,
     ConcurrencyLimitError,
     InvalidStateError,
+    IterationLimitExceededError,
     RunAlreadyExistsError,
     RunNotFoundError,
     RunTimeoutError,
@@ -931,6 +933,20 @@ class WorkflowEngine:
             except WorkflowError as exc:
                 self._fail(resolved_run_id, str(exc))
                 raise
+            except GraphRecursionError as exc:
+                # The graph hit its own backstop. The router's iteration budget is
+                # meant to stop a runaway repair loop long before this, so reaching
+                # it means the loop was not the one the budget counts — but the
+                # business answer is the same: this run used up its allowance and
+                # needs a human. Reported as an infrastructure error it reads like
+                # a fault, and nobody pages anyone for a fault that is in fact a
+                # decision.
+                raised = IterationLimitExceededError(
+                    f"the graph exhausted its recursion limit: {exc}",
+                    run_id=resolved_run_id,
+                )
+                self._fail(resolved_run_id, str(raised))
+                raise raised from exc
             except Exception as exc:
                 # A node raising something outside the taxonomy (a provider
                 # blowing up, a malformed response) must still leave a durable,
