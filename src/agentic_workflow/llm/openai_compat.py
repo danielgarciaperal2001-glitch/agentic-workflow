@@ -205,10 +205,14 @@ def _to_completion(response: Any, *, fallback_model: str) -> Completion:
 def _classify(exc: Exception, *, model: str) -> ProviderError:
     """Translate an SDK exception into our retry-aware error hierarchy.
 
-    The mapping is intentionally conservative: anything we cannot positively
-    identify as transient is raised as a non-retryable
-    :class:`~agentic_workflow.errors.ProviderError` so a bad API key fails fast
-    instead of burning the whole retry budget.
+    The mapping is intentionally conservative: only failures we can positively
+    identify as transient get a retryable error, and everything else is
+    classified by its status code, so a bad API key (401) fails on the first
+    attempt instead of burning the whole retry budget. A failure with no
+    recognisable shape at all falls back to :class:`ProviderError`, which the
+    base class treats as retryable — the alternative, refusing to retry a
+    response we failed to parse, would turn a formatting hiccup into a dead
+    run.
     """
     name = type(exc).__name__
     status = getattr(exc, "status_code", None)

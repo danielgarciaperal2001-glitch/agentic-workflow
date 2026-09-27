@@ -307,6 +307,9 @@ class ProviderError(WorkflowError):
         retry_after: Seconds the provider asked us to wait, parsed from a
             ``Retry-After`` header. ``None`` means "fall back to exponential
             backoff". Part of the public contract: the retry loop reads it.
+        retryable: Whether a retry can plausibly succeed. Overridable per
+            instance so a provider that distinguishes transient from
+            permanent failures can say so.
     """
 
     code = ErrorCode.PROVIDER_ERROR
@@ -314,6 +317,13 @@ class ProviderError(WorkflowError):
 
     def __init__(self, message: str = "", /, **context: Any) -> None:
         self.retry_after: float | None = context.pop("retry_after", None)
+        # Consume `retryable` from the context and bind it to the instance.
+        # Left in the context it would only be echoed by `to_dict`'s message
+        # while the `retryable` field kept the class default — so a 4xx the
+        # caller explicitly marked permanent would still advertise itself as
+        # retryable to the API client. Same treatment as `retry_after` above.
+        if "retryable" in context:
+            self.retryable = bool(context.pop("retryable"))
         super().__init__(message, **context)
 
 

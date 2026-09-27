@@ -32,8 +32,6 @@ from pydantic import BaseModel, ValidationError
 
 from agentic_workflow.errors import (
     ProviderError,
-    ProviderRateLimitedError,
-    ProviderTimeoutError,
     SchemaValidationError,
 )
 from agentic_workflow.logging import get_logger
@@ -223,7 +221,15 @@ class LLMClient(ABC):
                     attempt=attempt,
                 )
                 return completion
-            except (ProviderRateLimitedError, ProviderTimeoutError) as exc:
+            except ProviderError as exc:
+                # Honour the flag rather than a hardcoded tuple of exception
+                # types. Every error class declares `retryable` precisely so an
+                # adapter can say "a 503 is worth another attempt, a 401 is
+                # not"; keying off the class name instead silently discarded
+                # both, so a transient 5xx failed the whole run on the first
+                # try and a caller could not make a permanent failure cheap.
+                if not exc.retryable:
+                    raise
                 last_error = exc
                 if attempt >= self.max_retries:
                     break
@@ -236,8 +242,6 @@ class LLMClient(ABC):
                     model=self.model,
                 )
                 await _sleep(delay)
-            except ProviderError:
-                raise
             except Exception as exc:
                 last_error = ProviderError(
                     f"provider call failed: {exc}",
