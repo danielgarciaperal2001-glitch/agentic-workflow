@@ -227,14 +227,102 @@ awf janitor --retention-days 7        # do it
 awf janitor --retention-days 7 --json | jq
 ```
 
-Schedule it. `RetentionReport` separates `examined`, `stale`, `deleted` and
-`undated`; `undated` is the one to watch — it counts threads whose age could not
-be determined, and the janitor **keeps** them.
+Schedule it, and read the report before you trust it. `RetentionReport` separates
+`examined`, `stale`, `deleted` and `undated`; `undated` is the one to watch — it
+counts threads whose age could not be determined, and the janitor **keeps** them.
 
 That is deliberate: the sweep fails closed. An undecidable age resolves to
 "keep", never "delete", and is counted and logged so it is visible rather than
 silent. A retention job that deletes on a parse error is a retention job that
 eventually deletes the wrong thing.
+
+#### Scheduling it
+
+Three facts shape the schedule.
+
+* **A pass is bounded, and `stale` is the truth about the store.** `--limit`
+  (default 1000) caps how many threads one invocation deletes; `stale` reports
+  the whole backlog, limited or not. A backlog larger than the limit drains
+  across repeated passes — each pass deletes the next `--limit` — and a `stale`
+  that keeps returning at the cap is the report telling you more remains.
+* **The exit code is not the whole signal.** A store that refuses to open or
+  list raises, the command exits 1, and the `error: PersistenceError` line on
+  stderr is the alert. A store that lists *nothing* is legitimate (a fresh
+  deployment) and exits 0 with `examined: 0` and a warning that the sweep saw
+  no threads — so alert on `examined: 0` only when you know there should be
+  threads, and on `stale` for the backlog.
+* **A scheduled run needs the runtime's own configuration** — `AWF_POSTGRES_ENABLED=1`
+  and `AWF_POSTGRES_DSN`. A `--memory` janitor would sweep only what that one
+  process wrote, which on a schedule is nothing.
+
+Run it with `--dry-run` the first day and read `stale` in the `--json` output,
+then schedule the real thing.
+
+**cron** — on the host that can reach the checkpointer. The cron environment
+carries no `PATH`, so the binary path is explicit; the JSON line on stdout is
+what a monitoring check should parse, not the exit code:
+
+```bash
+# crontab -e
+17 3 * * * AWF_POSTGRES_ENABLED=1 \
+           AWF_POSTGRES_DSN='postgresql://agentic:agentic@db:5432/agentic' \
+           /opt/agentic-workflow/bin/awf janitor --json \
+           >> /var/log/awf-janitor.log 2>&1
+```
+
+**systemd** — a oneshot unit on a timer, so output lands in the journal and
+`Persistent=true` covers a host that was down at the scheduled time:
+
+```ini
+# /etc/systemd/system/awf-janitor.service
+[Unit]
+Description=Checkpoint retention pass
+[Service]
+Type=oneshot
+Environment=AWF_POSTGRES_ENABLED=1
+Environment=AWF_POSTGRES_DSN=postgresql://agentic:agentic@db:5432/agentic
+ExecStart=/opt/agentic-workflow/bin/awf janitor --json
+```
+
+```ini
+# /etc/systemd/system/awf-janitor.timer
+[Unit]
+Description=Daily checkpoint retention
+[Timer]
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+```
+
+**Kubernetes** — a CronJob using the runtime image, so it inherits the
+environment the API runs with, and the pod's stdout is the log:
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: awf-janitor
+spec:
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: janitor
+              image: <the runtime image>
+              command: ["awf", "janitor", "--json"]
+              envFrom:
+                - secretRef:
+                    name: awf-postgres   # supplies AWF_POSTGRES_ENABLED / AWF_POSTGRES_DSN
+```
+
+Whichever schedule you choose, alert on `examined: 0` or a rising `stale` long
+before the disk fills; the run's own exit code is not the signal.
 
 ### I need to know what a model actually did
 
