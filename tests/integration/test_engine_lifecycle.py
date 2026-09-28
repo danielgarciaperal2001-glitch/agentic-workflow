@@ -1212,7 +1212,11 @@ class TestProviderResources:
             second = engine._context_for(None, "run-b")
 
             assert first is not second, "each run needs its own sink to attribute events"
-            assert first.client is second.client
+            # Each drive gets its own wrapper so usage can be attributed to it...
+            assert first.client is not second.client
+            # ...but every wrapper is a lens over the one process-wide client:
+            # one semaphore, one ceiling.
+            assert first.client.delegate is second.client.delegate
         finally:
             await engine.cancel_all()
             await engine.shutdown()

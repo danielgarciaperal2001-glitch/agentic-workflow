@@ -38,6 +38,7 @@ from agentic_workflow.domain.schemas import (
     utcnow,
 )
 from agentic_workflow.errors import RunAlreadyExistsError, RunNotFoundError
+from agentic_workflow.llm.base import Usage
 from agentic_workflow.logging import get_logger
 
 log = get_logger(__name__)
@@ -107,6 +108,9 @@ class RunRecord:
         created_at / updated_at: ISO-8601 lifecycle markers.
         error: Terminal error message, if the run failed.
         metadata: Free-form, log-safe annotations (request id, actor, …).
+        usage: LLM usage attributed to this run so far, accumulated across
+            every drive the engine performed. Process memory, like the rest
+            of the registry: the authoritative state is the checkpoint.
     """
 
     run_id: str
@@ -118,6 +122,7 @@ class RunRecord:
     updated_at: str = field(default_factory=lambda: utcnow().isoformat())
     error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    usage: Usage = field(default_factory=Usage)
 
     def __post_init__(self) -> None:
         """Reject a status outside the lifecycle vocabulary.

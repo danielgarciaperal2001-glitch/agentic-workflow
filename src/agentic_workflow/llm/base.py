@@ -369,6 +369,107 @@ class LLMClient(ABC):
         return float(base * (0.5 + jitter / 2))
 
 
+#: Provider-identity fields copied from the delegate so callers see the same
+#: configuration through a wrapper. The concurrency ceiling, retries and
+#: timeouts stay where they belong: on the shared client.
+_PROVIDER_FIELDS: tuple[str, ...] = (
+    "model",
+    "temperature",
+    "max_tokens",
+    "timeout_seconds",
+    "max_retries",
+    "max_concurrency",
+    "base_url",
+)
+
+
+class UsageScopedClient(LLMClient):
+    """Account the completions one caller causes through a shared client.
+
+    Not a provider: it delegates every call to a shared :class:`LLMClient`
+    (the process-wide one), so the provider semaphore, retries and timeouts
+    all keep working exactly once. What it adds is attribution: the ``usage``
+    carried by each returned :class:`Completion` is merged into this wrapper's
+    own :class:`Usage`, read off the response rather than inferred from
+    counters.
+
+    Because attribution happens per completed call instead of by diffing a
+    shared counter over a time window, concurrent callers are charged exactly
+    — a sibling run's tokens are never credited to this one, and this run's
+    schema-repair retries always are. The engine binds one of these per drive
+    and accumulates the run's total across drives in the registry.
+
+    Args:
+        delegate: The client that actually talks to the provider. Ownership
+            stays with the caller: closing a wrapper never closes the delegate.
+    """
+
+    def __init__(self, delegate: LLMClient) -> None:
+        super().__init__(**{name: getattr(delegate, name) for name in _PROVIDER_FIELDS})
+        self.delegate = delegate
+        self._usage = Usage()
+
+    @property
+    def usage(self) -> Usage:
+        """The usage attributed to this wrapper so far."""
+        return self._usage
+
+    @property
+    def total_usage(self) -> Usage:
+        """The attributed usage; identical to :attr:`usage`.
+
+        Overridden so nothing reading the ``LLMClient`` contract sees the
+        process-wide total through this wrapper instead of its own share.
+        """
+        return self._usage
+
+    async def _complete(
+        self,
+        messages: Sequence[Message],
+        **kwargs: Any,
+    ) -> Completion:
+        """Unreachable: the wrapper delegates and never calls this hook.
+
+        Raised rather than implemented so a future refactor cannot silently
+        drop the accounting by reverting to ``super().complete``.
+        """
+        raise NotImplementedError("UsageScopedClient delegates instead of completing")
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        response_format: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Completion:
+        """Delegate to the shared client and record the call's usage.
+
+        The delegate handles the concurrency semaphore, retries and timeouts;
+        this method only observes the response, so the process-wide ceiling is
+        untouched and attribution is exact per completed call.
+        """
+        completion = await self.delegate.complete(
+            messages, response_format=response_format, **kwargs
+        )
+        self._usage = self._usage.merge(completion.usage)
+        return completion
+
+    async def aclose(self) -> None:
+        """Release nothing: the delegate is the engine's, not this wrapper's.
+
+        Closing a per-run wrapper must not take down the process-wide client
+        while other runs are mid-flight on it.
+        """
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate unknown attributes to the shared client.
+
+        Provider subclasses carry extra state (``EchoLLM.latency_ms``) that
+        callers may legitimately read; the wrapper must not hide it.
+        """
+        return getattr(self.delegate, name)
+
+
 async def _sleep(seconds: float) -> None:
     """Await *seconds* without importing asyncio at module import time."""
     import asyncio

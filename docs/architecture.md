@@ -305,13 +305,13 @@ the report does not exist *yet* rather than never.
 
 ## The API
 
-22 REST operations and 2 WebSocket routes, all under `/v1` except the health
+23 REST operations and 2 WebSocket routes, all under `/v1` except the health
 probes.
 
 | Group | Operations |
 | --- | --- |
 | Health | `GET /health/live`, `GET /health/ready` |
-| Runs | create, list, read, report, timings, decisions, cancel, resume |
+| Runs | create, list, read, report, usage, timings, decisions, cancel, resume |
 | Approvals | list, read, diff, resolve, replay, audit, stats, sweep |
 | Threads | history, checkpoints, one checkpoint, replay |
 | WebSocket | `/ws/runs/{run_id}`, `/ws/events` |

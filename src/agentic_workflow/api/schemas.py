@@ -190,6 +190,16 @@ class RunDetail(APIModel):
     error: str | None = None
     is_parked: bool = False
     is_finished: bool = False
+    usage: dict[str, float | int] = Field(
+        default_factory=dict,
+        description=(
+            "LLM usage attributed to the operation that produced this view: "
+            "the whole run for an auto-resolved start, that drive's share for "
+            "a parked start or a resolve. Reads served straight from the "
+            "checkpoint (``GET /v1/runs/{id}``) carry no attribution; use "
+            "``GET /v1/runs/{id}/usage`` for the run-wide total to date."
+        ),
+    )
 
 
 class RunListResponse(APIModel):

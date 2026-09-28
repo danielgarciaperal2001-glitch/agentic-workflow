@@ -76,7 +76,7 @@ from agentic_workflow.graph.runtime import (
     thread_config,
 )
 from agentic_workflow.human.gates import decode_interrupt, stage_from_approval_id
-from agentic_workflow.llm.base import Usage, build_llm_client
+from agentic_workflow.llm.base import Usage, UsageScopedClient, build_llm_client
 from agentic_workflow.logging import bind_context, get_logger
 from agentic_workflow.persistence.checkpointer import build_checkpointer
 from agentic_workflow.persistence.repository import RunRegistry, RunStatus
@@ -165,6 +165,10 @@ class RunOutcome:
         checkpoint_id: Identifier of the checkpoint the outcome was read from.
         next_nodes: Nodes LangGraph intends to execute next (non-empty when
             parked on an interrupt).
+        usage: LLM usage attributed to this drive (start, resume or replay).
+            Exactly the completions the drive caused, per call, so concurrent
+            runs never blur into each other. :meth:`~WorkflowEngine.run_until_done`
+            reports the whole run; the registry accumulates it across drives.
     """
 
     run_id: str
@@ -177,6 +181,7 @@ class RunOutcome:
     error: str | None = None
     checkpoint_id: str | None = None
     next_nodes: tuple[str, ...] = ()
+    usage: Usage = field(default_factory=Usage)
 
     @property
     def is_parked(self) -> bool:
@@ -213,6 +218,7 @@ class RunOutcome:
             "error": self.error,
             "report": self.report.model_dump(mode="json") if self.report else None,
             "next_nodes": list(self.next_nodes),
+            "usage": self.usage.as_dict(),
         }
 
     @property
@@ -608,6 +614,7 @@ class WorkflowEngine:
             InvalidStateError: If the gate budget is exhausted.
         """
         outcome = await self.start(request, context=context)
+        total_usage = outcome.usage
         answered = 0
         while outcome.is_parked and outcome.pending is not None:
             if answered >= max_gates:
@@ -624,8 +631,11 @@ class WorkflowEngine:
             if value is None:
                 break
             outcome = await self.resume(request.run_id, value, context=context)
+            total_usage = total_usage.merge(outcome.usage)
             answered += 1
-        return outcome
+        # Every drive reported only its own share; the caller asked for the
+        # whole run, so merge them: this outcome's usage is the run's total.
+        return replace(outcome, usage=total_usage)
 
     # ------------------------------------------------------------ status #
     async def status(self, run_id: str) -> RunOutcome:
@@ -1051,8 +1061,10 @@ class WorkflowEngine:
         runs, and every event it receives has to be attributable. Copying the
         template keeps the run id out of the shared object.
 
-        Every path through here ends up with the same LLM client, which is what
-        makes the provider concurrency ceiling mean what the setting says.
+        Every path through here ends up with a usage wrapper over the same
+        underlying client, which is what makes the provider concurrency ceiling
+        mean what the setting says. Each drive's wrapper is fresh, so the
+        drive's completions can be attributed to it alone.
         """
         if context is not None:
             return self._bind_client(context)
@@ -1060,7 +1072,7 @@ class WorkflowEngine:
         if template is None:
             return AgentContext(
                 settings=self._settings,
-                llm=self._shared_llm(),
+                llm=self._scoped_llm(),
                 emit=self._event_sink,
             )
         if self._event_sink is None or template.emit is not None:
@@ -1085,7 +1097,66 @@ class WorkflowEngine:
         """
         if context.llm is not None:
             return context
-        return replace(context, llm=self._shared_llm())
+        return replace(context, llm=self._scoped_llm())
+
+    def _scoped_llm(self) -> UsageScopedClient:
+        """Wrap the process-wide client so this drive is charged for its calls.
+
+        The wrapper shares the underlying client — same semaphore, retries and
+        timeouts — but records each completion's usage against the drive that
+        caused it. One wrapper per drive keeps the run's attribution open for
+        the whole drive and lets the outcome report exactly what that drive
+        spent.
+        """
+        return UsageScopedClient(self._shared_llm())
+
+    def _attach_usage(self, ctx: AgentContext, outcome: RunOutcome) -> RunOutcome:
+        """Attribute this drive's completions to the run and record them.
+
+        Called on every settled path — finished, parked, cancelled,
+        interrupted and rejected alike — so no settlement can drop the spend.
+        The drive's usage is merged onto the run's registry record, which is
+        what lets a parked run later answer "spent so far" across drives.
+
+        A context carrying a caller-supplied client instead of one of ours
+        contributes nothing: the engine does not own that client and cannot
+        see its spend.
+
+        Args:
+            ctx: The drive's runtime context, whose scoped client holds the
+                usage this drive caused.
+            outcome: The settled outcome to carry the usage.
+
+        Returns:
+            A copy of *outcome* with ``usage`` set to this drive's share.
+        """
+        usage = self._usage_of(ctx)
+        record = self._registry.find(outcome.run_id)
+        if record is not None:
+            record.usage = record.usage.merge(usage)
+        return replace(outcome, usage=usage)
+
+    def _usage_of(self, ctx: AgentContext) -> Usage:
+        """Return the usage the drive's scoped client recorded, else zeros."""
+        if isinstance(ctx.llm, UsageScopedClient):
+            return ctx.llm.usage
+        return Usage()
+
+    def _merge_usage(self, run_id: str, ctx: AgentContext) -> None:
+        """Merge the drive's usage onto the run record without an outcome.
+
+        Used by the failure paths, which raise instead of settling: a run that
+        dies must still account for the tokens it spent on the way down, or a
+        post-mortem reading ``/runs/{id}/usage`` would underestimate what a
+        failed run burned.
+
+        Args:
+            run_id: The run stalled or aborted.
+            ctx: The drive's context, whose scoped client holds the usage.
+        """
+        record = self._registry.find(run_id)
+        if record is not None:
+            record.usage = record.usage.merge(self._usage_of(ctx))
 
     def _shared_llm(self) -> Any:
         """Return the process-wide LLM client, building it on first use.
@@ -1186,25 +1257,32 @@ class WorkflowEngine:
                     # Operator-driven: settle as cancelled rather than tearing
                     # down the caller's coroutine, which is not itself cancelled.
                     self._running.pop(resolved_run_id, None)
-                    return await self._settle_halted(
-                        resolved_run_id,
-                        "cancelled by operator",
-                        status="cancelled",
-                        snap=await self._aget_state(resolved_run_id),
+                    return self._attach_usage(
+                        ctx,
+                        await self._settle_halted(
+                            resolved_run_id,
+                            "cancelled by operator",
+                            status="cancelled",
+                            snap=await self._aget_state(resolved_run_id),
+                        ),
                     )
                 if resolved_run_id in self._interrupted:
                     # The process is going away. Settled, rather than propagated,
                     # for the same reason: the caller is not being cancelled, the
                     # deployment is ending.
                     self._running.pop(resolved_run_id, None)
-                    return await self._settle_halted(
-                        resolved_run_id,
-                        INTERRUPTED_REASON,
-                        status="interrupted",
-                        snap=await self._aget_state(resolved_run_id),
+                    return self._attach_usage(
+                        ctx,
+                        await self._settle_halted(
+                            resolved_run_id,
+                            INTERRUPTED_REASON,
+                            status="interrupted",
+                            snap=await self._aget_state(resolved_run_id),
+                        ),
                     )
                 raise
             except TimeoutError as exc:
+                self._merge_usage(resolved_run_id, ctx)
                 self._fail(resolved_run_id, f"run exceeded its {timeout:g}s budget")
                 raise RunTimeoutError(
                     f"run exceeded its {timeout:g}s budget",
@@ -1218,14 +1296,18 @@ class WorkflowEngine:
                 # to this run?") and deserves an answer, not a stack trace. The
                 # REST layer already maps the error to 200 for the same reason.
                 self._running.pop(resolved_run_id, None)
-                rejected = await self._settle_rejected(
-                    resolved_run_id,
-                    str(exc),
-                    snap=await self._aget_state(resolved_run_id),
+                rejected = self._attach_usage(
+                    ctx,
+                    await self._settle_rejected(
+                        resolved_run_id,
+                        str(exc),
+                        snap=await self._aget_state(resolved_run_id),
+                    ),
                 )
                 await self._emit_run_end(rejected)
                 return rejected
             except WorkflowError as exc:
+                self._merge_usage(resolved_run_id, ctx)
                 self._fail(resolved_run_id, str(exc))
                 raise
             except GraphRecursionError as exc:
@@ -1240,18 +1322,20 @@ class WorkflowEngine:
                     f"the graph exhausted its recursion limit: {exc}",
                     run_id=resolved_run_id,
                 )
+                self._merge_usage(resolved_run_id, ctx)
                 self._fail(resolved_run_id, str(raised))
                 raise raised from exc
             except Exception as exc:
                 # A node raising something outside the taxonomy (a provider
                 # blowing up, a malformed response) must still leave a durable,
                 # explainable record rather than an orphaned thread.
+                self._merge_usage(resolved_run_id, ctx)
                 self._fail(resolved_run_id, f"{type(exc).__name__}: {exc}")
                 raise
             finally:
                 self._running.pop(resolved_run_id, None)
 
-            outcome = await self._settle(resolved_run_id, pending)
+            outcome = self._attach_usage(ctx, await self._settle(resolved_run_id, pending))
             await self._emit_run_end(outcome)
             return outcome
 

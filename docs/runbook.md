@@ -370,9 +370,26 @@ honestly. They are exported as monotonic counters (`awf_llm_calls_total`,
 `awf_llm_cached_tokens_total`); the same numbers appear in the JSON object the
 endpoint returns when it cannot render exposition text. A fresh process reads
 all zeros: the client is built lazily, so empty really means "no calls yet".
-Note what the aggregate is *not*: per-run. To attribute spend to a single run,
-use the per-run node timing above plus the number of model calls in that run's
-log lines.
+Note what the aggregate is *not*: per-run. The engine attributes LLM usage to
+each run at the source — it wraps the shared client per drive and records the
+usage each completion actually reports — so a single run's spend is available
+without counting log lines:
+
+```bash
+curl -s localhost:8000/v1/runs/$RUN_ID/usage
+# {"run_id": "...", "usage": {"prompt_tokens": ..., "completion_tokens": ...,
+#   "cached_tokens": ..., "calls": ..., "total_tokens": ...}}
+```
+
+The attributed totals accumulate on the run registry across every drive
+(start and each resolve), so a parked run answers "what has it cost so far".
+Because the attribution is per completed call rather than a process-counter
+diff, concurrent runs are charged exactly — no double counting. Two caveats,
+both deliberate: the registration lives in process memory (the authoritative
+state is the checkpoint), so the numbers restart from empty with the process;
+and the operation payloads themselves carry the spend — `POST /v1/runs` shows
+the whole run when `auto_resolve` is set, or that drive's share when it
+parks.
 
 ## Verifying a change did not break quality
 

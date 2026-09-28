@@ -64,6 +64,7 @@ def project_detail(outcome: RunOutcome) -> RunDetail:
         error=outcome.error,
         is_parked=outcome.is_parked,
         is_finished=outcome.is_finished,
+        usage=outcome.usage.as_dict(),
     )
 
 
@@ -390,6 +391,41 @@ async def list_timings(
         "slowest_node": slowest.node if slowest else None,
         "slowest_ms": round(slowest.duration_ms, 3) if slowest else None,
     }
+
+
+@router.get(
+    "/{run_id}/usage",
+    summary="LLM usage attributed to a run",
+    responses={404: {"description": "No such run exists."}},
+)
+async def get_run_usage(
+    run_id: Annotated[str, Path(min_length=1, max_length=128)],
+    engine: EngineDep,
+    _: AuthDep,
+) -> dict[str, Any]:
+    """Return the LLM usage attributed to this run so far.
+
+    The totals accumulate on the registry across every drive the engine has
+    performed for the run — the parked start, each resolve — so this answers
+    "what has it cost" without counting model calls in log lines. Unlike a
+    checkpoint read, the attribution is process memory: after a restart it
+    begins empty again even though the run's state survives.
+
+    Args:
+        run_id: The run to inspect.
+        engine: The workflow engine.
+        _: Authentication dependency.
+
+    Returns:
+        A mapping with the attributed usage counters.
+
+    Raises:
+        RunNotFoundError: If no such run exists.
+    """
+    record = engine.registry.find(run_id)
+    if record is None:
+        raise RunNotFoundError("no such run", run_id=run_id)
+    return {"run_id": run_id, "usage": record.usage.as_dict()}
 
 
 def _auto_decider(decision: Decision) -> Any:
