@@ -51,6 +51,7 @@ from agentic_workflow.api.routers import approvals, events, health, runs, thread
 from agentic_workflow.config import Settings, load_settings
 from agentic_workflow.domain.schemas import utcnow
 from agentic_workflow.human.service import ApprovalService
+from agentic_workflow.llm.base import Usage
 from agentic_workflow.logging import bind_context, configure_logging, get_logger
 from agentic_workflow.services.engine import WorkflowEngine
 
@@ -273,6 +274,7 @@ def _meta_router() -> APIRouter:
                 "events": "WS /ws/runs/{run_id}",
                 "live": "GET /health/live",
                 "ready": "GET /health/ready",
+                "metrics": "GET /metrics",
             },
         }
 
@@ -297,14 +299,32 @@ def _meta_router() -> APIRouter:
             "version": __version__,
             "runs": len(engine.registry) if engine is not None else 0,
             "events": hub.stats() if hub is not None else {},
+            # Process-wide LLM spend since boot: the engine's one client serves
+            # every run, so this is the total, not a per-run slice.
+            "usage": (engine.llm_usage.as_dict() if engine is not None else Usage().as_dict()),
         }
         return _render_metrics(payload)
 
     return router
 
 
+# Usage keys on the payload map to their Prometheus counter names. Cached and
+# completion tokens share a family with plain tokens: the process-wide totals
+# since boot, exported with the ``_total`` suffix monotonic counters require.
+_USAGE_COUNTERS: tuple[tuple[str, str], ...] = (
+    ("calls", "awf_llm_calls_total"),
+    ("prompt_tokens", "awf_llm_prompt_tokens_total"),
+    ("completion_tokens", "awf_llm_completion_tokens_total"),
+    ("cached_tokens", "awf_llm_cached_tokens_total"),
+)
+
+
 def _render_metrics(payload: dict[str, Any]) -> Response:
     """Render counters as Prometheus text, falling back to JSON.
+
+    Event and run counters are gauges under a single ``awf_metric`` family;
+    the process-wide LLM usage is exported as monotonic counters, which is the
+    semantics a budget dashboard expects of token spend.
 
     Args:
         payload: The counters collected from the engine and the hub.
@@ -325,12 +345,16 @@ def _render_metrics(payload: dict[str, Any]) -> Response:
             content=json.dumps(payload, default=str),
             media_type="application/json",
         )
+    usage: dict[str, Any] = payload.get("usage") or {}
     lines = [
         "# HELP awf_metric agentic-workflow operational counter.",
         "# TYPE awf_metric gauge",
         *(f'awf_metric{{name="{name}"}} {value:g}' for name, value in sorted(flat.items())),
-        "",
     ]
+    for key, name in _USAGE_COUNTERS:
+        lines.append(f"# TYPE {name} counter")
+        lines.append(f"{name} {int(usage.get(key, 0)):g}")
+    lines.append("")
     return Response(content="\n".join(lines), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 

@@ -76,7 +76,7 @@ from agentic_workflow.graph.runtime import (
     thread_config,
 )
 from agentic_workflow.human.gates import decode_interrupt, stage_from_approval_id
-from agentic_workflow.llm.base import build_llm_client
+from agentic_workflow.llm.base import Usage, build_llm_client
 from agentic_workflow.logging import bind_context, get_logger
 from agentic_workflow.persistence.checkpointer import build_checkpointer
 from agentic_workflow.persistence.repository import RunRegistry, RunStatus
@@ -328,6 +328,26 @@ class WorkflowEngine:
             saver = getattr(saver, "saver", saver)
             self._graph = build_graph(self._settings, checkpointer=saver)
         return self._graph
+
+    @property
+    def llm_usage(self) -> Usage:
+        """Cumulative LLM usage attributed to this process.
+
+        The engine owns one client and injects it into every run (see
+        :meth:`_shared_llm`), so this aggregate is process-wide by construction:
+        the total across all runs, never a per-run slice. It is the number a
+        budget dashboard wants, because it is the number the process has
+        actually spent.
+
+        Returns:
+            The merged usage record since the process started, or an all-zeros
+            record when the client has never been built — the client is created
+            lazily, so a fresh engine has genuinely empty usage, not unknown.
+        """
+        if self._llm is None:
+            return Usage()
+        usage: Usage = self._llm.total_usage
+        return usage
 
     async def startup(self) -> None:
         """Open durable resources and compile the graph. Idempotent.

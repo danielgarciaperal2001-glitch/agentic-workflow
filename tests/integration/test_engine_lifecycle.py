@@ -373,6 +373,40 @@ class TestResume:
         assert edited["payload"] == {"instruction": "use Decimal", "touched_by": "alice"}
 
 
+class TestLlmUsage:
+    """The engine publishes the aggregate the client keeps for the process."""
+
+    async def test_usage_is_zero_before_the_client_is_built(self, engine: WorkflowEngine) -> None:
+        """A fresh engine has done no LLM calls: the aggregate is genuinely
+        zero, not unknown (the client is built lazily on first use).
+        """
+        assert engine.llm_usage.calls == 0
+        assert engine.llm_usage.prompt_tokens == 0
+        assert engine.llm_usage.completion_tokens == 0
+
+    async def test_usage_accumulates_across_runs(self, engine: WorkflowEngine) -> None:
+        """Every completed run moves the process-wide counters upward.
+
+        The property that makes the aggregate usable for budget tracking is
+        that a finished run always contributes: calls and token counts strictly
+        grow. Exact per-run doubling is not the contract — runs are not
+        byte-identical (run-scoped approval ids reach the next prompt through
+        the transcript, and echo's confidence jitter is a stable hash of that
+        prompt), so even identical requests can route slightly differently.
+        """
+        await asyncio.wait_for(engine.run_until_done(make_request(), decide=_approve), timeout=30)
+        first = engine.llm_usage
+        assert first.calls > 0
+        assert first.prompt_tokens > 0
+
+        await asyncio.wait_for(engine.run_until_done(make_request(), decide=_approve), timeout=30)
+        second = engine.llm_usage
+        assert second.calls > first.calls
+        assert second.prompt_tokens > first.prompt_tokens
+        assert second.completion_tokens > first.completion_tokens
+        assert second.total_tokens > first.total_tokens
+
+
 class TestStatus:
     """Reading a run's state."""
 

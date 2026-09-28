@@ -356,6 +356,24 @@ more than the node work itself. `benchmarks/bench.py` measures that gap
 explicitly as `gate_overhead`; the per-run `timings` endpoint shows only the
 nodes.
 
+### Total LLM spend
+
+```bash
+curl -s localhost:8000/metrics | grep awf_llm
+```
+
+The engine owns one LLM client per process and injects it into every run, so
+the token counts on `/metrics` are the process-wide total since boot — the
+number a budget dashboard wants, and the only number that can be reported
+honestly. They are exported as monotonic counters (`awf_llm_calls_total`,
+`awf_llm_prompt_tokens_total`, `awf_llm_completion_tokens_total`,
+`awf_llm_cached_tokens_total`); the same numbers appear in the JSON object the
+endpoint returns when it cannot render exposition text. A fresh process reads
+all zeros: the client is built lazily, so empty really means "no calls yet".
+Note what the aggregate is *not*: per-run. To attribute spend to a single run,
+use the per-run node timing above plus the number of model calls in that run's
+log lines.
+
 ## Verifying a change did not break quality
 
 ```bash
