@@ -434,12 +434,15 @@ def gate_scope(gate: str) -> frozenset[str] | None:
     never approve over your own critical finding — and the detection metrics
     (:data:`~evals.metrics.DETECTION_METRICS`) are properties of the *model*.
 
-    That split is what makes an offline gate possible. A CI job that gated on
-    every metric would have to spend a token to run, and gating the null
-    provider on recall would fail forever. A CI job that gated on nothing would
-    prove nothing at all. Gating the invariants keeps the job free,
-    reproducible, and still able to catch the class of regression that actually
-    breaks this system.
+    The default gate is ``"all"``. For a human running the report the strictest
+    verdict is the honest one, and on the null provider that means recall stays
+    red — the report saying exactly what the model cannot do. The split exists
+    so a *build* can opt into ``"invariants"`` instead: the invariants cost no
+    token, need no credentials, and are still properties of the workflow, which
+    a deterministic stub can violate exactly as well as a frontier model. That
+    is what makes an offline gate possible — a CI job that gated on recall
+    against the null provider would be red forever, and a job that is always
+    red is a job everyone learns to ignore.
 
     Args:
         gate: ``all``, ``invariants`` or ``detection``.
