@@ -352,7 +352,20 @@ class ApprovalService:
         return expired
 
     async def stats(self) -> dict[str, Any]:
-        """Return inbox counters for the dashboard and the readiness probe."""
+        """Return inbox counters, authoritative.
+
+        This is the ``GET /v1/approvals/stats`` payload, so it is computed the way
+        the rest of the inbox is: every known run read, every view built. That
+        costs O(runs) and it is the right trade here, because a human or a
+        dashboard asks occasionally and acts on the answer — including on
+        ``expired`` and ``resolved_pending``, which need the approval object and
+        the decision log and cannot be derived from the registry.
+
+        The readiness probe wants the same shape continuously and cannot afford it;
+        it uses :meth:`probe_stats` instead. Keeping the two apart is deliberate:
+        a probe that quietly returned the cheap numbers would be reporting zeros
+        for two counters a dashboard trusts.
+        """
         views = await self.inbox()
         by_stage: dict[str, int] = {}
         for view in views:
@@ -362,6 +375,46 @@ class ApprovalService:
             "expired": sum(1 for v in views if v.is_expired),
             "resolved_pending": sum(1 for v in views if v.already_resolved),
             "by_stage": by_stage,
+        }
+
+    async def probe_stats(self) -> dict[str, Any]:
+        """Return inbox counters in the shape a readiness probe can afford.
+
+        Counted from the run registry, with no store access at all, because the
+        caller is polled every few seconds whether or not anything is wrong.
+
+        Building the views in order to count them is not a small thing. The inbox
+        sweeps every known run and then reads each parked one a second time to
+        enrich it. Measured against a real PostgreSQL checkpointer, per probe:
+
+            parked runs      old (``stats``)    new (``probe_stats``)
+                       25            181 ms                2.3 ms
+                      100            728 ms                2.3 ms
+                      800          5,788 ms                4.7 ms
+
+        ``PROBE_TIMEOUT_SECONDS`` is 5, so the old cost turned a healthy instance
+        into a 503 — and so out of the load balancer — at around 700 parked runs,
+        which is a queue an ordinary backlog reaches. At that moment the store
+        check was also a no-op, so the expensive path was incidentally the only
+        thing still noticing an outage.
+
+        Two counters are reported as zero because they cannot be had for free:
+        ``expired`` lives on the approval object and ``resolved_pending`` needs the
+        decision log, and the registry keeps neither. Zero is a lie if a reader
+        takes it literally, which is why this method is not ``stats`` and why
+        :meth:`stats` remains the one a human reads.
+
+        The count is per-process. A run parked by another replica is not in this
+        registry, exactly as :meth:`~agentic_workflow.services.engine.WorkflowEngine.list_runs`
+        already documents; fanning out to every replica to produce a global count
+        is the cost being removed.
+        """
+        counts = self._engine.parked_summary()
+        return {
+            "pending": counts["pending"],
+            "expired": counts["expired"],
+            "resolved_pending": counts["resolved_pending"],
+            "by_stage": counts["by_stage"],
         }
 
     async def verify_log(self, run_id: str) -> list[dict[str, Any]]:

@@ -248,3 +248,10 @@ make every other guarantee here worthless.
 `resolved_pending` counts inbox entries whose decision is already in the log. A
 non-zero value usually means two operators answered the same gate; the log
 keeps the first and the audit view shows both.
+
+These four counters come from reading every known run, which is why this endpoint
+is the one to use. `/health/ready` reports the same shape but counts from
+per-process state and always reports `expired` and `resolved_pending` as `0`,
+because a probe polled every few seconds cannot afford the sweep. See
+[the runbook](runbook.md#what-the-readiness-probes-approval-numbers-mean) for the
+measured cost that forced the split.

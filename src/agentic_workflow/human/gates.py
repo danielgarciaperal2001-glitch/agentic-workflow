@@ -150,22 +150,23 @@ def approval_id_for(run_id: str, stage: Stage, iteration: int) -> str:
     return f"apr_{run_id}_{stage.value}_{iteration:02d}_{digest}"
 
 
-def run_id_from_approval_id(approval_id: str) -> str | None:
-    """Recover the run id an approval id was derived from.
+def _split_approval_id(approval_id: str) -> tuple[str, Stage] | None:
+    """Decompose a gate id into its run id and gated stage.
 
-    The inverse of :func:`approval_id_for`, and it exists for a performance
-    reason: locating a gate's run by scanning every run's decision log is
-    O(runs) on the hot path of every human decision, and the answer is already
-    encoded in the id. Parsing is done from the right because stage names contain
-    underscores while run ids do not — the wire layer enforces that alphabet, so
-    the three trailing components are unambiguous.
+    ``apr_<run>_<stage>_<iteration>_<digest>``, parsed from the right because
+    stage names contain underscores while run ids do not — the wire layer enforces
+    that alphabet, so the three trailing components are unambiguous. Two splits
+    rather than one, because the iteration is *not* the last component: the digest
+    is, and it is hex, so testing it with ``isdigit`` appears to work about 2% of
+    the time and silently returns ``None`` the rest.
 
     Args:
-        approval_id: The gate identifier to invert.
+        approval_id: The gate identifier to decompose.
 
     Returns:
-        The run id, or ``None`` if the value is not a gate id this function can
-        parse. ``None`` means "ask the store", not "no such run".
+        The run id and stage, or ``None`` if the value is not shaped like a gate
+        id this build can parse — an unrecognised stage included, so a caller can
+        never end up treating ``<run>_<unknown_stage>`` as a run id.
     """
     if not approval_id.startswith(APPROVAL_ID_PREFIX):
         return None
@@ -177,8 +178,48 @@ def run_id_from_approval_id(approval_id: str) -> str | None:
     for stage in Stage:
         marker = f"_{stage.value}"
         if candidate.endswith(marker):
-            return candidate[: -len(marker)] or None
+            return candidate[: -len(marker)], stage
     return None
+
+
+def run_id_from_approval_id(approval_id: str) -> str | None:
+    """Recover the run id an approval id was derived from.
+
+    The inverse of :func:`approval_id_for`, and it exists for a performance
+    reason: locating a gate's run by scanning every run's decision log is
+    O(runs) on the hot path of every human decision, and the answer is already
+    encoded in the id.
+
+    Args:
+        approval_id: The gate identifier to invert.
+
+    Returns:
+        The run id, or ``None`` if the value is not a gate id this function can
+        parse. ``None`` means "ask the store", not "no such run".
+    """
+    parts = _split_approval_id(approval_id)
+    return parts[0] if parts is not None else None
+
+
+def stage_from_approval_id(approval_id: str) -> str | None:
+    """Recover the gated stage an approval id was minted for.
+
+    The companion to :func:`run_id_from_approval_id`: the run id comes off the
+    front, the stage out of the middle. It exists for the same reason — the answer
+    is already encoded in the id, so reading it is free where recovering it from
+    the checkpoint is not. The readiness probe reports a per-stage breakdown of
+    parked runs, and the registry holds only the approval ids.
+
+    Args:
+        approval_id: The gate identifier to invert.
+
+    Returns:
+        The stage name, or ``None`` if the id is not shaped like a gate id or
+        names a stage this build does not know about. ``None`` means "cannot say",
+        so a caller should omit the id from a breakdown rather than guess.
+    """
+    parts = _split_approval_id(approval_id)
+    return parts[1].value if parts is not None else None
 
 
 def build_approval_request(
@@ -583,5 +624,6 @@ __all__ = [
     "request_decision",
     "run_id_from_approval_id",
     "sign_decision",
+    "stage_from_approval_id",
     "verify_decision",
 ]

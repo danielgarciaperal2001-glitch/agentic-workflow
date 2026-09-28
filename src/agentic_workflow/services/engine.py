@@ -75,7 +75,7 @@ from agentic_workflow.graph.runtime import (
     extract_interrupts,
     thread_config,
 )
-from agentic_workflow.human.gates import decode_interrupt
+from agentic_workflow.human.gates import decode_interrupt, stage_from_approval_id
 from agentic_workflow.llm.base import build_llm_client
 from agentic_workflow.logging import bind_context, get_logger
 from agentic_workflow.persistence.checkpointer import build_checkpointer
@@ -679,6 +679,53 @@ class WorkflowEngine:
         )
         pending = [o.pending for o in found if isinstance(o, RunOutcome) and o.pending]
         return sorted(pending, key=lambda request: request.created_at)
+
+    def parked_summary(self) -> dict[str, Any]:
+        """Count the runs this process knows to be parked, without touching the store.
+
+        The readiness probe's view of the approval queue. It exists because the
+        alternative — asking :meth:`pending_approvals` and then enriching every
+        view — is O(runs) checkpoint reads on a path an orchestrator calls
+        continuously, and the answer being computed is four integers.
+
+        The registry already records, on precisely the runs blocked on a human, a
+        ``pending_approval`` id, and that id encodes its own stage:
+        ``apr_<run>_<stage>_<iteration>_<digest>``. So the per-stage breakdown
+        comes out of the ids already held, with no read at all — the same
+        observation :func:`run_id_from_approval_id` is built on.
+
+        ``expired`` and ``resolved_pending`` are reported as zero rather than
+        guessed. Expiry lives on the approval object, which the registry does not
+        keep, and an already-answered approval needs the decision log, which means
+        reading the run. Inventing either would be worse than omitting it: a
+        probe that reports a wrong backlog is trusted and acted on. The inbox —
+        the human-facing path, where the numbers are read and acted on — still
+        computes them, and still reads what it needs.
+
+        Per-process by construction, and that is the same limitation
+        :meth:`list_runs` already documents: a run parked by another replica is
+        not in this registry. A global count would mean fanning out to every
+        replica from the probe, which is the cost being removed.
+
+        Returns:
+            Parked-run counts, with the per-stage breakdown.
+        """
+        by_stage: dict[str, int] = {}
+        pending = 0
+        for record in self._registry.list_runs(limit=10_000):
+            approval_id = record.pending_approval
+            if not approval_id or record.is_terminal:
+                continue
+            pending += 1
+            stage = stage_from_approval_id(approval_id)
+            if stage is not None:
+                by_stage[stage] = by_stage.get(stage, 0) + 1
+        return {
+            "pending": pending,
+            "expired": 0,
+            "resolved_pending": 0,
+            "by_stage": by_stage,
+        }
 
     # ------------------------------------------------------- time travel #
     async def history(self, run_id: str, *, limit: int = 50) -> list[CheckpointInfo]:

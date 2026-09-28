@@ -68,12 +68,43 @@ That is usually the right trade, and it is why the setting is opt-in.
 | Is the checkpointer reachable? | `awf janitor --dry-run` | A non-zero `examined` count |
 | Are gates flowing? | `GET /v1/approvals/stats` | `pending` moves |
 
+For approval counts, use `/v1/approvals/stats` and not the probe — see
+[What the readiness probe's approval numbers mean](#what-the-readiness-probes-approval-numbers-mean).
+
 `/health/live` and `/health/ready` are deliberately different. Liveness answers
 "should this process be restarted"; readiness answers "can it serve a request".
 Conflating them is how a database outage turns into a crash loop.
 
 Neither is rate limited. A liveness probe that can be rate-limited is a liveness
 probe that reports the process unhealthy because someone else is busy.
+
+### What the readiness probe's approval numbers mean
+
+`/health/ready` reports an `approvals` block, and it is **not** the same as
+`/v1/approvals/stats`. Read the table before trusting it during an incident:
+
+| Counter | `/health/ready` | `/v1/approvals/stats` |
+| --- | --- | --- |
+| `pending` | This process's parked runs | Every known run, read from the store |
+| `by_stage` | Same, derived from the approval ids | Same, from the approval objects |
+| `expired` | Always `0` | Real count |
+| `resolved_pending` | Always `0` | Real count |
+
+The two zeros are not "nothing is wrong". The probe counts from the run registry,
+which records *that* a run is parked and *which* approval, and holds neither the
+expiry date nor the decision log — so it reports zero rather than guess. Use
+`/v1/approvals/stats` for those two numbers.
+
+The registry is per-process, so a run parked by another replica is missing from
+`pending` here. That is the same caveat the run count in the same payload already
+carries.
+
+Why the split: the probe is polled every few seconds whether or not anything is
+wrong. Building the inbox to count it cost, against a real PostgreSQL, 181 ms per
+probe at 25 parked runs and 5,788 ms at 800 — past the 5 s budget, which meant a
+healthy instance reporting `503` and being dropped from the load balancer at
+around 700 parked runs. Counting from the registry is 2.3 ms and flat. The
+dashboard endpoint is read by a person, occasionally, and can afford the sweep.
 
 ## Common situations
 

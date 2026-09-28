@@ -683,6 +683,26 @@ class TestHumanInTheLoop:
         assert response.status_code == 200
         assert response.json()["pending"] >= 1
 
+    def test_the_public_stats_still_report_the_counters_the_cheap_one_omits(
+        self, app_client: TestClient, request_factory: Any
+    ) -> None:
+        """The readiness probe got a cheap path; this route must not have.
+
+        The probe counts from the registry, which cannot know whether an approval
+        has expired or already been answered — so it reports zero for both. That
+        trade is correct for a poll an orchestrator makes every few seconds and
+        wrong here, where a human reads the number and acts on it. Both counters
+        are present in this payload, which is what distinguishes it from the
+        probe's.
+        """
+        _parked(app_client, request_factory, "api-hitl-12b")
+
+        body = app_client.get("/v1/approvals/stats").json()
+
+        assert set(body) == {"pending", "expired", "resolved_pending", "by_stage"}
+        assert isinstance(body["expired"], int)
+        assert isinstance(body["resolved_pending"], int)
+
     def test_an_unknown_approval_is_a_404(self, app_client: TestClient) -> None:
         response = app_client.get("/v1/approvals/apr_nope_00_deadbeef")
 

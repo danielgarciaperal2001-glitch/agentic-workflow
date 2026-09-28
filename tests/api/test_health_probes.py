@@ -45,6 +45,18 @@ class _Engine:
         """
         return []
 
+    def parked_summary(self) -> dict[str, Any]:
+        """What the approval service's probe path calls.
+
+        Present for the same reason as ``pending_approvals``, and it is worth
+        spelling out why this is such a reliable way to break a test suite: the
+        readiness handler wraps each check in its own ``try``, so a missing method
+        becomes ``{"ok": false}`` and a 503 rather than an ``AttributeError``. A
+        stub that falls behind therefore fails every "the probe is healthy" test at
+        once, with a message that blames the probe.
+        """
+        return {"pending": 0, "expired": 0, "resolved_pending": 0, "by_stage": {}}
+
     def set_event_sink(self, sink: Any) -> None:
         """The lifespan always wires one; a stub that ignored it would be fine,
         but a stub that lacked it would fail before any assertion ran."""
@@ -59,12 +71,24 @@ class _Engine:
 
 
 class _Approvals:
-    """Approval inbox whose ``stats`` can be made to fail."""
+    """Approval service whose counters can be made to fail.
+
+    Both entry points are here because both exist: ``stats`` is what
+    ``GET /v1/approvals/stats`` serves, and ``probe_stats`` is what the readiness
+    probe calls. The error is raised from both, because a failure of the underlying
+    inbox fails both and a double that only fails one would test a distinction
+    this stub is not about.
+    """
 
     def __init__(self, error: Exception | None = None) -> None:
         self._error = error
 
     async def stats(self) -> dict[str, Any]:
+        if self._error is not None:
+            raise self._error
+        return {"pending": 0}
+
+    async def probe_stats(self) -> dict[str, Any]:
         if self._error is not None:
             raise self._error
         return {"pending": 0}
@@ -217,9 +241,14 @@ class TestReadiness:
 
         class _Working:
             calls = 0
+            reads = 0
 
             async def setup(self) -> Any:
                 type(self).calls += 1
+
+            async def aget_tuple(self, *args: Any, **kwargs: Any) -> Any:
+                type(self).reads += 1
+                return None
 
         saver = _Working()
         settings = _durable_settings()
@@ -229,7 +258,12 @@ class TestReadiness:
         assert first.status_code == 200
         assert first.json()["checks"]["checkpointer"] == {"ok": True}
         assert second.status_code == 200
+        # Both halves, and the distinction is the point: re-running DDL on every
+        # probe is needless work against the primary, but *not asking the store
+        # anything* is a readiness check that cannot fail. This assertion used to
+        # be the first without the second, and the second is what was missing.
         assert saver.calls == 1, "the DDL must not be re-run on every probe"
+        assert saver.reads == 2, "every probe must read from the store"
 
     def test_ready_reports_the_run_count(self) -> None:
         engine = _Engine()
