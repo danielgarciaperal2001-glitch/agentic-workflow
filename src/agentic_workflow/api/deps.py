@@ -14,6 +14,7 @@ seam instead of the whole process.
 from __future__ import annotations
 
 from collections import OrderedDict, deque
+import hashlib
 import hmac
 import time
 from typing import Annotated, Any, Final
@@ -21,7 +22,7 @@ from typing import Annotated, Any, Final
 from fastapi import Depends, Header, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 
 from agentic_workflow.api.events import EventHub
-from agentic_workflow.config import Settings
+from agentic_workflow.config import Settings, load_settings
 from agentic_workflow.errors import RateLimitedError
 from agentic_workflow.human.service import ApprovalService
 from agentic_workflow.logging import get_logger
@@ -225,28 +226,93 @@ def client_key(
     request: Request | WebSocket,
     *,
     authorization: str | None = None,
+    settings: Settings | None = None,
 ) -> str:
     """Derive the rate-limiter identity of a caller.
 
-    Uses the authenticated identity when there is one, falling back to the
-    forwarded client address. Keying on the *token* rather than the IP matters
-    behind a proxy, where every request otherwise appears to come from the load
-    balancer and a single busy user throttles everybody.
+    A limiter is only as good as its key, and a key the caller can choose is
+    not a key. Two inputs are available on every request and neither is
+    trustworthy on its own: an ``Authorization`` header, which is a claim rather
+    than a credential until it has been compared against the configured secret,
+    and ``X-Forwarded-For``, which is whatever the caller typed unless a
+    deployment has declared that it sits behind a proxy.
+
+    Both were used anyway. Measured against the previous implementation, with a
+    budget of five requests a minute: a client sending the same request twelve
+    times was cut off after five, while the same twelve requests were served
+    in full by rotating ``X-Forwarded-For``, and again by sending twelve
+    different ``Authorization`` headers. The limit was a counter the caller
+    could decline to take part in.
+
+    So the order is: a token that has been *verified* becomes the identity,
+    because authenticated callers behind one load balancer address should not
+    throttle each other. Otherwise the socket peer is the identity, the only
+    address the server learned rather than was told. Forwarded addresses are
+    consulted only under :attr:`Settings.api_trust_forwarded_for`, and then
+    only from the right, since a proxy appends to whatever the client sent and
+    the leftmost entry is therefore the one the caller wrote.
+
+    The token is reduced to a digest before it becomes part of a key. Buckets
+    outlive the request and can reach a dump or a log line, and key material has
+    no business in either. The previous suffix-based key was also not
+    collision-free: two different credentials sharing their last sixteen
+    characters shared a budget.
 
     Args:
         request: The inbound request or socket.
         authorization: Raw ``Authorization`` header, when available.
+        settings: Configuration. Read from ``request.app.state`` when omitted.
 
     Returns:
         A stable client key.
     """
-    if authorization:
-        return f"token:{authorization[-16:]}"
-    forwarded = None
-    if isinstance(request, Request):
-        forwarded = request.headers.get("x-forwarded-for")
-    host = request.client.host if request.client else "unknown"
-    return f"ip:{(forwarded or host).split(',')[0].strip()}"
+    resolved = settings if settings is not None else _settings_of(request)
+
+    expected = resolved.api_auth_token
+    if resolved.api_auth_enabled and authorization and expected is not None:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and hmac.compare_digest(token, expected.get_secret_value()):
+            return f"token:{hashlib.sha256(token.encode()).hexdigest()[:16]}"
+
+    return f"ip:{_peer_address(request, trust_forwarded=resolved.api_trust_forwarded_for)}"
+
+
+def _settings_of(request: Request | WebSocket) -> Settings:
+    """Read the application settings a request was served under.
+
+    Args:
+        request: The inbound request or socket.
+
+    Returns:
+        The settings, or the process defaults when the request carries no
+        application — which is the case for a socket that was never bound to an
+        app.
+    """
+    state = getattr(getattr(request, "app", None), "state", None)
+    settings = getattr(state, "settings", None)
+    return settings if isinstance(settings, Settings) else load_settings()
+
+
+def _peer_address(request: Request | WebSocket, *, trust_forwarded: bool) -> str:
+    """Resolve the address the server is willing to attribute this call to.
+
+    Args:
+        request: The inbound request or socket.
+        trust_forwarded: Whether the deployment declared a trusted proxy.
+
+    Returns:
+        An address, or ``"unknown"`` when the peer could not be determined.
+    """
+    if trust_forwarded:
+        headers = getattr(request, "headers", None)
+        forwarded = headers.get("x-forwarded-for") if headers is not None else None
+        if forwarded:
+            # Rightmost: the entry the trusted hop wrote, not the one the caller
+            # prefixed. A proxy handling a request that arrived with its own
+            # header appends to it, so the leftmost is attacker-controlled.
+            return forwarded.rsplit(",", 1)[-1].strip() or "unknown"
+    host = request.client.host if request.client else None
+    return host or "unknown"
 
 
 def rate_limited(request: Request) -> None:

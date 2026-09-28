@@ -38,6 +38,26 @@ open http://localhost:8000/docs
 The image is multi-stage, runs as a non-root user, and has no build tooling in
 the runtime layer. `docker compose up` is the whole setup.
 
+## Behind a reverse proxy
+
+If the API is not exposed directly, one setting decides whether the request
+limiter works at all: `AWF_API_TRUST_FORWARDED_FOR`.
+
+**Off by default, and it should stay off unless a proxy really is in front.**
+The limiter keys on the address the server learned, not the one it was told.
+`X-Forwarded-For` is written by the caller, so honouring it means the caller
+chooses its own budget — a rotation of that header defeats the limit entirely.
+
+Turn it on when the proxy overwrites the header rather than appending blindly,
+and when you have exactly one trusted hop in front of the service. The rightmost
+entry is the one used, so a client that pre-forges its own header is ignored; a
+chain of two or more proxies needs a different arrangement, because a single
+boolean cannot say how many hops to skip.
+
+The consequence of leaving it off is a shared budget, not a broken one: every
+request appears to come from the proxy, so the limit is effectively per-process.
+That is usually the right trade, and it is why the setting is opt-in.
+
 ## First things to check
 
 | Check | Command | Healthy looks like |
@@ -216,6 +236,7 @@ Everything is `AWF_`-prefixed. The ones worth knowing by heart:
 | `AWF_MAX_ITERATIONS` | `6` | Feedback-loop budget before the run is escalated. |
 | `AWF_STATE_RETENTION_DAYS` | `30` | Retention window for the janitor. |
 | `AWF_API_RATE_LIMIT_PER_MINUTE` | `120` | Per-client request budget. |
+| `AWF_API_TRUST_FORWARDED_FOR` | `false` | Key the limiter on `X-Forwarded-For`. Only behind a proxy that overwrites it. |
 | `AWF_LOG_FORMAT` | `console` | `json` for machine-readable logs. |
 
 `Settings` **refuses** `awf_`-prefixed keyword arguments, so

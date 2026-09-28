@@ -331,6 +331,16 @@ class Settings(BaseSettings):
         description="Bearer token accepted when `api_auth_enabled` is true.",
     )
     api_rate_limit_per_minute: int = Field(default=120, ge=0)
+    api_trust_forwarded_for: bool = Field(
+        default=False,
+        description=(
+            "Honour `X-Forwarded-For` when keying the rate limiter. Off by "
+            "default because the header is caller-writable: trusting it lets any "
+            "client pick a fresh budget per request. Enable only behind a proxy "
+            "that overwrites the header, and note that a single trusted hop is "
+            "assumed."
+        ),
+    )
     api_docs_enabled: bool = Field(
         default=True,
         description="Expose OpenAPI docs. Force off in production.",
