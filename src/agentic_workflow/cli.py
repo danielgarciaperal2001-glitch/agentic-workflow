@@ -570,6 +570,16 @@ async def _cmd_janitor(args: argparse.Namespace) -> int:
         # the JSON makes it unparseable — the failure is silent, because the
         # output still looks like it printed something.
         _rule("checkpoint janitor" + ("  (dry run)" if args.dry_run else ""))
+    # The engine's `startup` awaits this for its own checkpointer; the janitor
+    # builds one directly and had to do the same, or the first list hit a pool
+    # that was never opened. Without it the durable command could not run at all:
+    # for the `postgres` extra, `build_checkpointer` returns a
+    # `PostgresCheckpointer` wrapper whose docstring is explicit that `setup`
+    # must be awaited before use. `InMemorySaver` has no `setup`, so the guard
+    # is the branch.
+    setup = getattr(checkpointer, "setup", None)
+    if setup is not None:
+        await setup()
     report = await CheckpointJanitor(checkpointer, settings).run(
         retention_days=args.retention_days,
         dry_run=args.dry_run,

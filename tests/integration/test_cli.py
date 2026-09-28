@@ -30,6 +30,8 @@ import sys
 
 import pytest
 
+from agentic_workflow.config import load_settings
+
 pytestmark = pytest.mark.integration
 
 #: Every invocation is capped. A test that hangs is a test that stalls CI, and
@@ -210,6 +212,39 @@ class TestJsonOutputIsMachineReadable:
     def test_janitor_json_parses_with_nothing_above_it(self) -> None:
         result = run_cli("janitor", "--memory", "--dry-run", "--json")
         payload = json.loads(result.stdout)
+        assert "examined" in payload
+
+    @pytest.mark.postgres
+    def test_janitor_over_postgres_opens_the_pool(self) -> None:
+        """A durable retention sweep must list the store, not crash on entry.
+
+        The janitor built its checkpointer the way every other command does —
+        through ``build_checkpointer``, whose docstring is explicit that the
+        PostgreSQL variant is a *wrapper* that must be entered or have its
+        ``setup`` awaited before use — and then never set it up. The engine's
+        ``startup`` awaits exactly that; the janitor skipped the whole lifecycle,
+        so the first list hit a pool that was never opened, and the runbook's
+        readiness probe ``awf janitor --dry-run`` could not run against a real
+        database at all. The memory path never surfaced the bug, because
+        ``InMemorySaver`` has no lifecycle to skip.
+
+        Pre-fix, against the suite's own DSN, the command exited 1:
+
+            PersistenceError: janitor could not list checkpoints:
+            the pool 'pool-1' is not open yet
+        """
+        result = run_cli(
+            "janitor",
+            "--dry-run",
+            "--json",
+            env=(
+                ("AWF_POSTGRES_ENABLED", "true"),
+                ("AWF_POSTGRES_DSN", load_settings().postgres_dsn),
+            ),
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        payload = json.loads(result.stdout)
+        assert payload["dry_run"] is True
         assert "examined" in payload
 
 
