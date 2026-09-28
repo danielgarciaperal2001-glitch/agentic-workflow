@@ -43,12 +43,14 @@ class _Selection:
         checkpoints: Checkpoints those threads are expected to free.
         examined: Threads considered in this pass.
         undated: Checkpoints whose age could not be established.
+        stale: Every stale thread, before the pass limit is applied.
     """
 
     threads: list[str]
     checkpoints: int
     examined: int
     undated: int
+    stale: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +159,7 @@ class CheckpointJanitor:
                     log.warning("janitor.delete_failed", thread_id=thread_id, error=str(exc))
         report = RetentionReport(
             examined=selection.examined,
-            stale=len(threads),
+            stale=selection.stale,
             deleted=deleted,
             freed_checkpoints=selection.checkpoints,
             duration_seconds=time.perf_counter() - started,
@@ -217,6 +219,11 @@ class CheckpointJanitor:
             checkpoints=sum(d for _, d in selected),
             examined=len(per_thread),
             undated=undated,
+            # The full backlog, before the `limit` cap. The report's `stale`
+            # must mean "how stale is the store", not "how many did this pass
+            # reach": the latter is `len(threads)`, and it is the one that
+            # misled operators once the count exceeded the limit.
+            stale=len(stale),
         )
 
     def _saver(self) -> Any:

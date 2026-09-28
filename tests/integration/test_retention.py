@@ -190,6 +190,39 @@ class TestDeletion:
         with pytest.raises(Exception):  # noqa: B017 - any typed miss is acceptable
             await engine.history(run_ids[0])
 
+    async def test_stale_reports_the_whole_backlog_beyond_the_pass_limit(self) -> None:
+        """`stale` is how old the store is; the limit only bounds the delete.
+
+        A pass bounded at ``limit=2`` over a store with five old threads used to
+        report ``stale=2`` because the report was built from the *selected*
+        threads. That made ``stale`` read "how stale is the store" but mean "how
+        many did this pass reach", so an operator with a backlog could not see
+        that one existed — precisely the situation where the number matters. The
+        field's own documentation always promised the full count; the report only
+        disagreed with it under limit pressure.
+        """
+        engine, run_ids = await _seed(5)
+        settings = load_settings(postgres_enabled=False, log_level="WARNING")
+
+        report = await CheckpointJanitor(engine.checkpointer, settings).run(
+            retention_days=0, dry_run=True, limit=2
+        )
+
+        assert report.stale >= len(run_ids)
+        assert report.deleted == 0
+
+    async def test_the_delete_is_still_bounded_by_the_limit(self) -> None:
+        """The fix must not turn the cap into decoration."""
+        engine, run_ids = await _seed(5)
+        settings = load_settings(postgres_enabled=False, log_level="WARNING")
+
+        report = await CheckpointJanitor(engine.checkpointer, settings).run(
+            retention_days=0, limit=2
+        )
+
+        assert report.stale >= len(run_ids)
+        assert report.deleted == min(report.stale, 2)
+
     async def test_a_nonzero_window_spares_recent_work(self) -> None:
         """The common case: a sweep on a healthy system must delete nothing.
 
