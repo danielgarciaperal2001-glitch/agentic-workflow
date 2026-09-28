@@ -45,17 +45,15 @@ mode is a dashboard quietly showing a healthy backlog.
 
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Any
 
-from langgraph.checkpoint.memory import InMemorySaver
 import pytest
 
 from agentic_workflow.config import load_settings
 from agentic_workflow.human.service import ApprovalService
 from agentic_workflow.services.engine import WorkflowEngine
 from tests.api.test_health_probes import _client
-from tests.helpers import make_request
+from tests.helpers import CountingSaver, make_request
 
 pytestmark = pytest.mark.api
 
@@ -68,77 +66,6 @@ def _settings() -> Any:
     ambient environment passes in one job and fails in the other.
     """
     return load_settings().model_copy(update={"postgres_enabled": False})
-
-
-class _CountingStorage(defaultdict[Any, Any]):
-    """A ``defaultdict`` that counts reads and behaves identically without it.
-
-    Subclassing ``defaultdict`` rather than ``dict`` is load-bearing. The saver
-    reads threads that have never been written and relies on getting an empty
-    default back; a plain ``dict`` raises ``KeyError`` instead, which fails the
-    engine mid-run and looks like a repository bug rather than a broken probe.
-    That is not hypothetical — it is what the first version of this counter did.
-    """
-
-    def __init__(self, default_factory: Any = None) -> None:
-        super().__init__(default_factory)
-        self.reads = 0
-
-    def __getitem__(self, key: Any) -> Any:
-        self.reads += 1
-        return super().__getitem__(key)
-
-    def get(self, key: Any, default: Any = None) -> Any:
-        self.reads += 1
-        return super().get(key, default)
-
-    def __contains__(self, key: object) -> bool:
-        self.reads += 1
-        return super().__contains__(key)
-
-
-def _mirror(source: defaultdict[Any, Any]) -> _CountingStorage:
-    """Copy *source* into a counting defaultdict with the same factory.
-
-    Args:
-        source: The storage to mirror.
-
-    Returns:
-        An equivalent defaultdict that counts reads.
-    """
-    out = _CountingStorage(source.default_factory)
-    dict.update(out, source)
-    return out
-
-
-class _CountingSaver(InMemorySaver):
-    """In-memory checkpointer whose storage counts every read made against it.
-
-    Counting at the storage rather than wrapping the saver is not a stylistic
-    choice. The compiled graph holds the saver directly and reaches into its own
-    dicts, so a wrapper never sees a read — it reported zero for a probe that was
-    demonstrably issuing thousands. The storage is the only seam a read passes
-    through.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        # Replaced after the base constructor, so the base never builds a
-        # subclass it did not ask for. `stack` is an ExitStack, holds no
-        # checkpoints, and is left alone.
-        self.storage = _mirror(self.storage)
-        self.writes = _mirror(self.writes)
-        self.blobs = _mirror(self.blobs)
-        self.setup_calls = 0
-
-    @property
-    def reads(self) -> int:
-        """Total reads performed against the checkpoint storage."""
-        return self.storage.reads + self.writes.reads + self.blobs.reads
-
-    async def setup(self) -> None:
-        """The store probe's call, counted separately from the reads."""
-        self.setup_calls += 1
 
 
 async def _engine_with_parked_runs(saver: Any, count: int) -> WorkflowEngine:
@@ -178,7 +105,7 @@ class TestProbeCost:
         merely halved the inbox cost would still be linear, and would still take
         the instance out of the load balancer at a larger scale.
         """
-        saver = _CountingSaver()
+        saver = CountingSaver()
         engine = await _engine_with_parked_runs(saver, 40)
 
         try:
@@ -205,7 +132,7 @@ class TestProbeCost:
         up longer paid more per probe. This pins that a probe's price does not
         drift with the work it happens to be reporting on.
         """
-        saver = _CountingSaver()
+        saver = CountingSaver()
         engine = await _engine_with_parked_runs(saver, 40)
 
         try:
@@ -237,7 +164,7 @@ class TestStoreCheck:
         a readiness probe must never produce on a guess.
         """
         settings = load_settings().model_copy(update={"postgres_enabled": True})
-        saver = _CountingSaver()
+        saver = CountingSaver()
 
         with _client(_EngineWithSaver(saver), settings=settings) as client:
             first = client.get("/health/ready")
@@ -379,7 +306,7 @@ class TestCountingCorrectness:
         every run — rather than against ``stats()``, which is now the same cheap
         path and would make this a tautology.
         """
-        saver = _CountingSaver()
+        saver = CountingSaver()
         engine = await _engine_with_parked_runs(saver, 12)
         service = ApprovalService(engine)
 
@@ -406,7 +333,7 @@ class TestCountingCorrectness:
         this workflow has several gates — answering one parks the same run on the
         next, so the count legitimately holds at 3.
         """
-        saver = _CountingSaver()
+        saver = CountingSaver()
         engine = await _engine_with_parked_runs(saver, 3)
         service = ApprovalService(engine)
 
@@ -427,7 +354,7 @@ class TestCountingCorrectness:
         "a queue that is draining" from "a queue stuck at the same gate", and it
         is what a reviewer reads during an incident.
         """
-        saver = _CountingSaver()
+        saver = CountingSaver()
         engine = await _engine_with_parked_runs(saver, 3)
         service = ApprovalService(engine)
 
@@ -455,7 +382,7 @@ class TestCountingCorrectness:
         so, and this says it in code, so a later change that starts guessing has
         to argue with an assertion rather than with a comment.
         """
-        saver = _CountingSaver()
+        saver = CountingSaver()
         engine = await _engine_with_parked_runs(saver, 4)
         service = ApprovalService(engine)
 
@@ -478,7 +405,7 @@ class TestCountingCorrectness:
         approval check is silently broken still passes a test that only looks at
         the checkpointer.
         """
-        saver = _CountingSaver()
+        saver = CountingSaver()
         settings = _settings()
         engine = await _engine_with_parked_runs(saver, 7)
 

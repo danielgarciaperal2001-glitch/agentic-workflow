@@ -162,15 +162,75 @@ class ApprovalService:
             Enriched approval views. Expired approvals are included but flagged,
             because hiding them would leave a human wondering where their run went.
         """
-        pending = await self._engine.pending_approvals(run_id)
-        views: list[ApprovalView] = []
-        for request in pending:
-            outcome = await self._engine.status(request.run_id)
-            views.append(self._to_view(request, outcome, resolved_ids=_resolved_ids(outcome)))
-        return views
+        return [
+            self._to_view(outcome.pending, outcome, resolved_ids=_resolved_ids(outcome))
+            for outcome in await self._engine.parked_outcomes(run_id)
+            if outcome.pending is not None
+        ]
 
     async def get(self, approval_id: str) -> ApprovalView:
         """Fetch one approval by id.
+
+        Reads the one run that could own the approval instead of sweeping the inbox
+        to find it. An approval id names its own run —
+        ``apr_<run>_<stage>_<iteration>_<digest>`` — so the sweep was answering a
+        question the id had already answered. Measured against a real PostgreSQL
+        checkpointer with 40 parked runs, ``GET /v1/approvals/{id}`` cost 363 ms
+        because it built all 40 views to return one; this is one read.
+
+        It is also *more* correct than the sweep it replaces, not merely faster.
+        The sweep asked the engine for its known runs, which is a per-process
+        registry, so a run a sibling replica had parked was invisible to it. This
+        reads the checkpoint directly, so it finds the approval wherever it lives.
+
+        A parseable id is answered from that one run and only that run, with no
+        sweep on failure. That is not a shortcut taken for speed: the id names the
+        run it was minted for, the approval lives in that run's state, and the
+        digest is derived from run, stage and iteration — so an id naming a run
+        that is missing, or parked on a later gate, cannot be current for any other
+        run. Both are 404s, and scanning would only re-derive that.
+
+        The sweep is kept for the one case it can actually answer: an id that does
+        not parse, which is what :func:`run_id_from_approval_id`'s ``None`` means —
+        "ask the store", not "no such run".
+
+        Args:
+            approval_id: The approval to fetch.
+
+        Returns:
+            The enriched view.
+
+        Raises:
+            ApprovalNotFoundError: If no run is currently parked on that id.
+        """
+        owner = run_id_from_approval_id(approval_id)
+        if owner is None:
+            return await self._get_by_scan(approval_id)
+        try:
+            outcome = await self._engine.status(owner)
+        except RunNotFoundError as exc:
+            raise ApprovalNotFoundError(
+                "no pending approval with that id", approval_id=approval_id
+            ) from exc
+        if outcome.pending is not None and outcome.pending.approval_id == approval_id:
+            return self._to_view(outcome.pending, outcome, resolved_ids=_resolved_ids(outcome))
+        # Either the run holds a different gate now — so this id is stale rather
+        # than unknown — or it is not parked at all. Both are a 404, and returning
+        # the run's *current* gate here would hand the caller a different approval
+        # than the one they asked about.
+        raise ApprovalNotFoundError("no pending approval with that id", approval_id=approval_id)
+
+    async def _get_by_scan(self, approval_id: str) -> ApprovalView:
+        """Locate an approval by building the inbox.
+
+        The fallback for :meth:`get` when the id does not name its own run, which
+        is the only case a scan can answer.
+
+        Args:
+            approval_id: The approval to find.
+
+        Returns:
+            The enriched view.
 
         Raises:
             ApprovalNotFoundError: If no run is currently parked on that id.

@@ -12,9 +12,12 @@ suite that only exercises the degenerate case tests the wrong thing.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Callable
 from itertools import count
 from typing import Any
+
+from langgraph.checkpoint.memory import InMemorySaver
 
 from agentic_workflow.domain.schemas import (
     ApprovalDecision,
@@ -200,9 +203,84 @@ request_factory: Callable[..., ReviewRequest] = make_request
 approval_factory: Callable[..., ApprovalRequest] = make_approval
 decision_factory: Callable[..., ApprovalDecision] = make_decision
 
+
+class CountingStorage(defaultdict[Any, Any]):
+    """A ``defaultdict`` that counts reads and behaves identically without it.
+
+    Subclassing ``defaultdict`` rather than ``dict`` is load-bearing. The saver
+    reads threads that have never been written and relies on getting an empty
+    default back; a plain ``dict`` raises ``KeyError`` instead, which fails the
+    engine mid-run and looks like a repository bug rather than a broken test
+    double. That is not hypothetical — it is what the first version of this
+    counter did.
+    """
+
+    def __init__(self, default_factory: Any = None) -> None:
+        super().__init__(default_factory)
+        self.reads = 0
+
+    def __getitem__(self, key: Any) -> Any:
+        self.reads += 1
+        return super().__getitem__(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        self.reads += 1
+        return super().get(key, default)
+
+    def __contains__(self, key: object) -> bool:
+        self.reads += 1
+        return super().__contains__(key)
+
+
+def _mirror(source: defaultdict[Any, Any]) -> CountingStorage:
+    """Copy *source* into a counting defaultdict with the same factory.
+
+    Args:
+        source: The storage to mirror.
+
+    Returns:
+        An equivalent defaultdict that counts reads.
+    """
+    out = CountingStorage(source.default_factory)
+    dict.update(out, source)
+    return out
+
+
+class CountingSaver(InMemorySaver):
+    """In-memory checkpointer whose storage counts every read made against it.
+
+    Counting at the storage rather than wrapping the saver is not a stylistic
+    choice. The compiled graph holds the saver directly and reaches into its own
+    dicts, so a wrapper never sees a read — it reported zero for work that was
+    demonstrably issuing thousands. The storage is the only seam a read passes
+    through.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Replaced after the base constructor, so the base never builds a
+        # subclass it did not ask for. `stack` is an ExitStack, holds no
+        # checkpoints, and is left alone.
+        self.storage = _mirror(self.storage)
+        self.writes = _mirror(self.writes)
+        self.blobs = _mirror(self.blobs)
+        self.setup_calls = 0
+
+    @property
+    def reads(self) -> int:
+        """Total reads performed against the checkpoint storage."""
+        return self.storage.reads + self.writes.reads + self.blobs.reads
+
+    async def setup(self) -> None:
+        """The store probe's call, counted separately from the reads."""
+        self.setup_calls += 1
+
+
 __all__ = [
     "BUGGY_SOURCE",
     "FIXED_SOURCE",
+    "CountingSaver",
+    "CountingStorage",
     "approval_factory",
     "decision_factory",
     "make_approval",
