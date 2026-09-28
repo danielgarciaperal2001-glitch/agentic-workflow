@@ -361,7 +361,6 @@ ApprovalsDep = Annotated[ApprovalService, Depends(get_approvals)]
 HubDep = Annotated[EventHub, Depends(get_hub)]
 AuthDep = Annotated[None, Depends(require_auth)]
 RateLimitDep = Annotated[None, Depends(rate_limited)]
-ClientKeyDep = Annotated[str, Depends(lambda request: client_key(request))]
 
 
 def websocket_auth(websocket: WebSocket, token: str | None = None) -> None:
@@ -391,7 +390,6 @@ def websocket_auth(websocket: WebSocket, token: str | None = None) -> None:
 __all__ = [
     "ApprovalsDep",
     "AuthDep",
-    "ClientKeyDep",
     "EngineDep",
     "HubDep",
     "RateLimitDep",
