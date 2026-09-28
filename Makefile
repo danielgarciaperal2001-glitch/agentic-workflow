@@ -147,14 +147,6 @@ down: ## Stop the compose stack
 logs: ## Tail compose logs
 	$(COMPOSE) logs -f --tail=100
 
-.PHONY: db-migrate
-db-migrate: ## Apply Alembic migrations
-	$(PY) -m alembic upgrade head
-
-.PHONY: db-revision
-db-revision: ## Autogenerate a migration: make db-revision MSG="add runs table"
-	$(PY) -m alembic revision --autogenerate -m "$(or $(MSG),auto)"
-
 .PHONY: clean
 clean: ## Remove caches and build artefacts
 	rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov build dist *.egg-info

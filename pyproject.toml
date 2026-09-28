@@ -57,8 +57,6 @@ dependencies = [
 postgres = [
   "langgraph-checkpoint-postgres>=3.0,<5.0",
   "psycopg[binary,pool]>=3.1",
-  "sqlalchemy>=2.0",
-  "alembic>=1.13",
 ]
 # HTTP + realtime transport for the control plane.
 api = [
