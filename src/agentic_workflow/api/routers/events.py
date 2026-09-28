@@ -39,9 +39,13 @@ router = APIRouter(tags=["events"])
 #: Events after which a run will not produce another one on its own.
 #:
 #: A rejection counts: the human said no, the run is over, and a client that kept
-#: the socket open would wait for an answer that is never coming.
+#: the socket open would wait for an answer that is never coming. So does an
+#: interruption — the process driving the run is gone, so nothing more is coming
+#: from that run on that socket. A member of this set that the engine never emits
+#: is a socket that never closes; a status missing from it is one that hangs a
+#: subscriber forever. ``tests/api/test_runs_api.py`` pins the correspondence.
 TERMINAL_EVENTS: frozenset[str] = frozenset(
-    {"run.completed", "run.failed", "run.cancelled", "run.rejected"}
+    {"run.completed", "run.failed", "run.cancelled", "run.interrupted", "run.rejected"}
 )
 
 

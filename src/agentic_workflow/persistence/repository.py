@@ -57,11 +57,21 @@ RunStatus = Literal[
     "completed",
     "failed",
     "cancelled",
+    "interrupted",
     "rejected",
 ]
 
 #: Statuses that will not change again. Used by pollers to stop waiting.
-TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled", "rejected"})
+#:
+#: ``interrupted`` is in here because nothing further will happen to the run on
+#: its own — the process that was driving it is gone. It is not, however, the
+#: same as ``cancelled``: that one means a person stopped the work, and the
+#: distinction is the reason the status exists. Recovery is a fresh attempt from
+#: a checkpoint, not a resume, because an interrupted run was stopped between
+#: super-steps rather than parked on an approval.
+TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"completed", "failed", "cancelled", "interrupted", "rejected"}
+)
 
 #: The runtime mirror of :data:`RunStatus`.
 #:

@@ -146,6 +146,45 @@ actual bugs before they were written down:
   unregistered status is not in `TERMINAL_STATUSES`, so every poller waiting on
   that run waits forever.
 
+### A deploy interrupted in-flight runs
+
+Shutting the process down stops whatever it was carrying. Those runs are recorded
+as **`interrupted`**, not `cancelled`, and the boot of the next process logs:
+
+```
+engine.shutdown_interrupted runs=3 run_ids=['a1b2…', 'c3d4…', 'e5f6…']
+```
+
+That line is the work that needs a human. Anything not named there completed,
+parked on its own, or failed on its own terms.
+
+**Recovering one is a replay, not a resume.** An interrupted run was stopped
+between graph steps rather than waiting on an approval, so it has no pending
+decision for `POST /v1/runs/{id}/resume` to apply — that returns `422` by design.
+Find its last checkpoint and replay from it:
+
+```bash
+curl -s localhost:8000/v1/runs/a1b2... | jq '.history[-1].checkpoint_id'
+curl -s -X POST localhost:8000/v1/threads/a1b2.../replay \
+     -H 'content-type: application/json' \
+     -d '{"checkpoint_id": "1f0e…"}'
+```
+
+A replay **forks**: the new work is appended to the same thread as a sibling of
+the interrupted history, so what happened before is still there to compare
+against. Runs waiting on a human come back as `waiting_human` and are resumed
+the ordinary way.
+
+Two supporting details, so the record is not a surprise. `interrupted` is
+terminal — a poller stops waiting on it, because nothing will move it on its own.
+And the WebSocket for an interrupted run closes rather than hanging, because
+`run.interrupted` is a terminal event; before it existed, a subscriber to a
+departing run's stream waited forever for an event that was never published.
+
+The distinction matters more than it looks. `cancelled` means a person stopped
+the work and it is recorded as their decision. A rolling deploy is not a person,
+and an audit trail that cannot tell the two apart is not one.
+
 ### Disk is filling up
 
 Checkpoints accumulate. The janitor removes whole thread histories older than

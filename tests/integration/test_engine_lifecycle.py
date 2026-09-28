@@ -645,6 +645,235 @@ class TestCancellation:
             assert summary.status in {"cancelled", "completed", "failed", "waiting_human"}
 
 
+class _HeldRun:
+    """A run suspended mid-execution inside its engine.
+
+    The gate is an event sink, which the run's driver publishes to once the
+    run's task is already registered as in flight — so the engine is genuinely
+    holding live work, the precondition every test below needs and an awkward
+    one to arrange.
+
+    The ordering inside :meth:`stop` is load-bearing, and the comment there
+    explains why. It is the kind of thing that would otherwise be "simplified"
+    into a test that still passes and costs ten seconds.
+    """
+
+    def __init__(
+        self, engine: WorkflowEngine, arrived: asyncio.Event, latch: asyncio.Event
+    ) -> None:
+        self.engine = engine
+        self.arrived = arrived
+        self.latch = latch
+        #: Every event the run published, so a test can assert on the ones a
+        #: WebSocket subscriber would have to act on.
+        self.events: list[str] = []
+
+    async def start(self, request: ReviewRequest) -> asyncio.Task[RunOutcome]:
+        """Begin a run and block until the engine is holding it.
+
+        Args:
+            request: The run to submit.
+
+        Returns:
+            The task driving the run, for the caller to await after stopping.
+        """
+        task = asyncio.create_task(self.engine.start(request))
+        await asyncio.wait_for(self.arrived.wait(), timeout=10)
+        return task
+
+    async def stop(self, task: asyncio.Task[RunOutcome]) -> RunOutcome:
+        """Shut the engine down and collect how the run was recorded.
+
+        The latch is opened *after* the shutdown, and that order is the point.
+        ``run.started`` is published by the driver rather than by the run's own
+        task, so cancelling the run's task during shutdown leaves the driver
+        still parked in the sink, one line short of the cancellation it needs to
+        observe. Leaving the latch shut does not fail the test: the ``wait_for``
+        below eventually cancels the driver, which settles the run through the
+        very branch under test. So the assertions pass *on the timeout*, and the
+        test silently costs ten seconds doing it.
+
+        Args:
+            task: The task returned by :meth:`start`.
+
+        Returns:
+            The outcome the caller was given for the run.
+        """
+        await self.engine.shutdown()
+        self.latch.set()
+        return await asyncio.wait_for(task, timeout=10)
+
+    async def close(self) -> None:
+        """Open the gate and shut the engine down, for the tests' teardown."""
+        self.latch.set()
+        await self.engine.shutdown()
+
+
+async def _engine_with_a_gate() -> _HeldRun:
+    """Build a started engine whose runs can be suspended on demand.
+
+    Returns:
+        The gate, wrapping an engine that is already started and wired to the
+        sink driving it.
+    """
+    arrived = asyncio.Event()
+    latch = asyncio.Event()
+    seen: list[str] = []
+
+    async def sink(event: dict[str, Any]) -> None:
+        seen.append(str(event.get("event")))
+        # The first event a run publishes is `run.started`, emitted once its task
+        # is already registered in `_running`. Blocking there holds the run.
+        if not arrived.is_set():
+            arrived.set()
+            await latch.wait()
+
+    engine = WorkflowEngine(
+        Settings(_env_file=None, llm_provider="echo", log_level="ERROR"),
+        checkpointer=build_memory_checkpointer(),
+        event_sink=sink,
+    )
+    await engine.startup()
+    gate = _HeldRun(engine, arrived, latch)
+    gate.events = seen
+    return gate
+
+
+class TestShutdownInterruptions:
+    """What a process stopping does to the work it was carrying.
+
+    The distinction this class exists to protect: an operator stopping a run and
+    an orchestrator replacing a process are different events, and a record that
+    cannot tell them apart is not a record. It is the audit trail's whole job to
+    tell them apart.
+    """
+
+    async def test_a_run_in_flight_at_shutdown_is_recorded_as_interrupted(self) -> None:
+        """A deployment must not be recorded as an operator decision.
+
+        Shutdown used to route every live run through :meth:`cancel`, so a
+        rolling deploy wrote ``cancelled`` against work that no person touched.
+        An operator reading the run list afterwards would conclude a colleague
+        had killed a dozen reviews, and the record could not be argued with —
+        which is the specific failure an audit trail exists to prevent.
+        """
+        gate = await _engine_with_a_gate()
+        try:
+            request = make_request()
+            outcome = await gate.stop(await gate.start(request))
+
+            assert outcome.status == "interrupted"
+            assert (await gate.engine.status(request.run_id)).status == "interrupted"
+        finally:
+            await gate.close()
+
+    async def test_an_operator_cancellation_still_reads_as_cancelled(
+        self, engine: WorkflowEngine
+    ) -> None:
+        """A person stopping a run and a process exiting must stay separable.
+
+        Adding a distinct status is only worth anything if the original one keeps
+        its meaning, so this runs both paths side by side. Collapsing them would
+        satisfy the test above and destroy the distinction, which is the whole
+        reason the status was added.
+        """
+        outcome = await engine.start(make_request())
+        await engine.cancel(outcome.run_id, reason="not needed")
+        by_operator = (await engine.status(outcome.run_id)).status
+
+        gate = await _engine_with_a_gate()
+        try:
+            request = make_request(run_id=unique_run_id())
+            await gate.stop(await gate.start(request))
+            by_shutdown = (await gate.engine.status(request.run_id)).status
+        finally:
+            await gate.close()
+
+        assert by_operator == "cancelled"
+        assert by_shutdown == "interrupted"
+
+    async def test_the_record_does_not_claim_a_person_did_it(self) -> None:
+        """The reason names the process, so the record is not a false accusation."""
+        gate = await _engine_with_a_gate()
+        try:
+            request = make_request()
+            await gate.stop(await gate.start(request))
+            recorded = await gate.engine.status(request.run_id)
+
+            assert recorded.error is not None
+            assert "operator" not in recorded.error.lower()
+            assert "cancelled" not in recorded.error.lower()
+        finally:
+            await gate.close()
+
+    async def test_an_interruption_is_published_as_a_terminal_event(self) -> None:
+        """A subscriber watching the run is told it ended, not that it parked.
+
+        The event name is derived from the status, and a status missing from that
+        map falls through to ``run.parked`` — which asserts the opposite: that a
+        human decision is on its way. A dashboard that reads that waits for an
+        approval that is never going to be requested, on a run whose process has
+        already gone.
+        """
+        gate = await _engine_with_a_gate()
+        try:
+            await gate.stop(await gate.start(make_request()))
+
+            assert "run.interrupted" in gate.events
+            assert "run.parked" not in gate.events
+        finally:
+            await gate.close()
+
+    async def test_shutdown_says_which_runs_it_interrupted(self) -> None:
+        """The operator is told what to go and look at.
+
+        Interrupting a run is a thing a human has to act on afterwards. Silent
+        cleanup leaves exactly one way to find the work — diffing a run list
+        taken before the deploy against one taken after — which nobody does.
+        """
+        from structlog.testing import capture_logs
+
+        gate = await _engine_with_a_gate()
+        try:
+            request = make_request()
+            await gate.start(request)
+
+            with capture_logs() as logs:
+                await gate.engine.shutdown()
+            gate.latch.set()
+
+            reported = [
+                entry for entry in logs if entry.get("event") == "engine.shutdown_interrupted"
+            ]
+            assert reported, [entry.get("event") for entry in logs]
+            assert request.run_id in reported[0]["run_ids"]
+        finally:
+            await gate.close()
+
+    async def test_resume_refuses_an_interrupted_run(self) -> None:
+        """An interruption is not a decision waiting for a decision.
+
+        Pinning this on purpose. The tempting fix is to make ``interrupted``
+        resumable, and it would be wrong: an interrupted run was stopped between
+        super-steps, so it is not parked on an approval and has no decision
+        payload to apply. Recovery is replaying the latest checkpoint, which
+        forks a new branch, and promising otherwise would trade a wrong status
+        for a wrong recovery path.
+        """
+        gate = await _engine_with_a_gate()
+        try:
+            request = make_request()
+            await gate.stop(await gate.start(request))
+
+            with pytest.raises(InvalidStateError):
+                await gate.engine.resume(
+                    request.run_id,
+                    {"approval_id": "apr_x", "decision": "approve", "reviewer": "a"},
+                )
+        finally:
+            await gate.close()
+
+
 class TestConcurrency:
     """The bounds that keep a shared deployment alive."""
 

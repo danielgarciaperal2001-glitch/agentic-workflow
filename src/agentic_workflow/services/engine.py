@@ -91,12 +91,23 @@ Decider = Callable[[ApprovalRequest], Any]
 RUN_STATUSES: Final[frozenset[str]] = frozenset(get_args(RunStatus))
 
 #: Statuses that will not change again.
-FINAL_STATUSES: Final[frozenset[str]] = frozenset({"completed", "failed", "cancelled", "rejected"})
+FINAL_STATUSES: Final[frozenset[str]] = frozenset(
+    {"completed", "failed", "cancelled", "interrupted", "rejected"}
+)
 
 #: Terminal statuses the *graph* cannot report about itself, because the node
 #: that would have written them raised or was interrupted instead. They are
 #: recorded on the registry and overlaid on every subsequent read.
-_OUTSIDE_OVERLAY_STATUSES: Final[frozenset[str]] = frozenset({"cancelled", "rejected"})
+_OUTSIDE_OVERLAY_STATUSES: Final[frozenset[str]] = frozenset(
+    {"cancelled", "interrupted", "rejected"}
+)
+
+#: Recorded against a run the engine stopped because its process is exiting.
+#: Names the recovery path, because a run left with no hint of one is the kind of
+#: thing an operator works out during an incident.
+INTERRUPTED_REASON: Final[str] = (
+    "process shutting down; replay from the last checkpoint to continue"
+)
 
 
 @dataclass(slots=True)
@@ -270,6 +281,7 @@ class WorkflowEngine:
         self._llm: Any = None
         self._running: dict[str, asyncio.Task[list[ApprovalRequest]]] = {}
         self._cancelled: set[str] = set()
+        self._interrupted: set[str] = set()
         self._started = False
         self._lock = asyncio.Lock()
 
@@ -416,8 +428,17 @@ class WorkflowEngine:
         )
 
     async def shutdown(self) -> None:
-        """Cancel in-flight runs and release durable resources."""
-        await self.cancel_all()
+        """Stop in-flight runs and release durable resources.
+
+        Runs in flight are interrupted rather than cancelled, and the ids are
+        logged at warning level. Both are deliberate. The status keeps a deploy
+        from being recorded as an operator decision, and the log is what makes the
+        affected work findable — a shutdown that drains quietly leaves an
+        operator no reason to go looking for the runs it stopped.
+        """
+        interrupted = await self.interrupt_all()
+        if interrupted:
+            log.warning("engine.shutdown_interrupted", runs=len(interrupted), run_ids=interrupted)
         if self._owns_checkpointer:
             close = getattr(self._checkpointer, "close", None)
             if close is not None:
@@ -753,8 +774,16 @@ class WorkflowEngine:
 
         Cancellation is cooperative: the in-flight task is cancelled and the
         status recorded. Because LangGraph checkpoints after every super-step,
-        cancelling never loses completed work — a later ``resume`` picks up from
-        the last checkpoint.
+        cancelling never loses completed work.
+
+        It does mean ``resume`` will refuse the run afterwards, which is worth
+        being exact about rather than reassuring. A cancelled run is not parked
+        on an approval, so it has no decision to apply, and the guard in
+        :meth:`resume` rejects it. Recovering the work means :meth:`replay_from`
+        on the last checkpoint, which forks a new branch and leaves the cancelled
+        history intact. This docstring previously claimed a plain ``resume``
+        would pick the run back up; it would not, and the claim is what made the
+        gap look like a documentation problem rather than a missing feature.
 
         Args:
             run_id: The run to cancel.
@@ -797,14 +826,66 @@ class WorkflowEngine:
             task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await task
-        await self._settle_cancelled(run_id, reason)
+        await self._settle_halted(run_id, reason, status="cancelled")
         log.info("run.cancelled", run_id=run_id, reason=reason)
 
     async def cancel_all(self) -> None:
-        """Cancel every in-flight run. Used on shutdown."""
+        """Cancel every in-flight run, as an operator would cancel each one.
+
+        Used by tests and by callers draining an engine they own. :meth:`shutdown`
+        deliberately does not go through here — see :meth:`interrupt_all`.
+        """
         for run_id in list(self._running):
             with suppress(Exception):
-                await self.cancel(run_id, reason="engine shutting down")
+                await self.cancel(run_id, reason="engine draining")
+
+    async def interrupt_all(self) -> list[str]:
+        """Stop every in-flight run because this process is going away.
+
+        The mechanics are :meth:`cancel`'s, because a task suspended in an HTTP
+        request has to be cancelled either way or the event loop will not close.
+        The record is not: the run is settled as ``interrupted`` rather than
+        ``cancelled``, because no operator asked for it and the difference is the
+        one an audit trail exists to preserve. Writing ``cancelled`` here meant a
+        rolling deploy recorded a colleague's decision against work nobody
+        touched, and nothing in the record could be argued with afterwards.
+
+        Recovery is not a resume. An interrupted run was stopped between
+        super-steps, so it is not parked on an approval and has no decision to
+        apply; it has to be replayed from its last checkpoint, which forks a new
+        branch. The reason recorded says so, because a run left at ``stopped by
+        an orchestrator`` with no hint of the recovery path is the kind of thing
+        an operator discovers during an incident.
+
+        Returns:
+            The ids of the runs that were interrupted, in the order they were
+            stopped. The caller is expected to log them: silent cleanup is what
+            makes interrupted work undiscoverable.
+        """
+        stopped: list[str] = []
+        for run_id in list(self._running):
+            # Marked before cancelling, for the same reason `cancel` does it: the
+            # driving coroutine reads the set to tell why it was cancelled, and a
+            # flag set after the task unwinds arrives too late to be seen.
+            self._interrupted.add(run_id)
+            task = self._running.get(run_id)
+            if task is not None and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+            # Settled here as well as in `_drive`, because the two race: a task
+            # cancelled between `add` and `cancel` is already gone by the time we
+            # look, and would otherwise leave no record at all.
+            self._running.pop(run_id, None)
+            with suppress(Exception):
+                await self._settle_halted(
+                    run_id,
+                    INTERRUPTED_REASON,
+                    status="interrupted",
+                    snap=await self._aget_state(run_id),
+                )
+            stopped.append(run_id)
+        return stopped
 
     # --------------------------------------------------------- internals #
     async def _guard_reentry(self, run_id: str) -> None:
@@ -996,13 +1077,29 @@ class WorkflowEngine:
                 pending = await task
             except asyncio.CancelledError:
                 await _abort(task)
+                # Operator intent is checked first on purpose. A person who
+                # cancelled a run must not have the record rewritten to say an
+                # orchestrator did it, even if a deploy happened to land a moment
+                # later.
                 if resolved_run_id in self._cancelled:
                     # Operator-driven: settle as cancelled rather than tearing
                     # down the caller's coroutine, which is not itself cancelled.
                     self._running.pop(resolved_run_id, None)
-                    return await self._settle_cancelled(
+                    return await self._settle_halted(
                         resolved_run_id,
                         "cancelled by operator",
+                        status="cancelled",
+                        snap=await self._aget_state(resolved_run_id),
+                    )
+                if resolved_run_id in self._interrupted:
+                    # The process is going away. Settled, rather than propagated,
+                    # for the same reason: the caller is not being cancelled, the
+                    # deployment is ending.
+                    self._running.pop(resolved_run_id, None)
+                    return await self._settle_halted(
+                        resolved_run_id,
+                        INTERRUPTED_REASON,
+                        status="interrupted",
                         snap=await self._aget_state(resolved_run_id),
                     )
                 raise
@@ -1166,30 +1263,41 @@ class WorkflowEngine:
         await self._emit("run.rejected", run_id=run_id, reason=reason, iteration=outcome.iteration)
         return outcome
 
-    async def _settle_cancelled(
-        self, run_id: str, reason: str, *, snap: Any | None = None
+    async def _settle_halted(
+        self, run_id: str, reason: str, *, status: str, snap: Any | None = None
     ) -> RunOutcome:
-        """Project a cancelled run, forcing the terminal ``cancelled`` status.
+        """Project a run that something outside the graph stopped.
 
-        The pending gate is cleared for the same reason as in
-        :meth:`_settle_rejected`: the checkpoint still lists the interrupted
-        approval, so the projection would otherwise hand back an outcome that
-        both says ``cancelled`` and says "waiting on a human".
+        Used for both of the ways execution can end without the graph's
+        cooperation: :meth:`cancel`, and the interruption of a process on its way
+        out. They share the mechanics — clear the pending gate, force a terminal
+        status the graph could never have written, and record it so later reads
+        overlay it — and differ only in which status is honest.
+
+        Args:
+            run_id: The run that was stopped.
+            reason: What stopped it, as recorded on the run.
+            status: ``"cancelled"`` for an operator's decision, ``"interrupted"``
+                for a process that went away underneath the run.
+            snap: The run's last checkpoint, when it is already at hand.
+
+        Returns:
+            The projected outcome.
         """
         if snap is None:
-            outcome = RunOutcome(run_id=run_id, status="cancelled", state={}, error=reason)
+            outcome = RunOutcome(run_id=run_id, status=status, state={}, error=reason)  # type: ignore[arg-type]
         else:
             outcome = self._outcome_from_snapshot(run_id, snap)
-            outcome.status = "cancelled"
+            outcome.status = status  # type: ignore[assignment]
             outcome.error = reason
             outcome.pending = None
         self._record(
             run_id,
-            status="cancelled",
+            status=status,
             error=reason,
             pending_approval=outcome.pending.approval_id if outcome.pending else None,
         )
-        await self._emit("run.cancelled", run_id=run_id, reason=reason, iteration=outcome.iteration)
+        await self._emit(f"run.{status}", run_id=run_id, reason=reason, iteration=outcome.iteration)
         return outcome
 
     def _record(self, run_id: str, **fields: Any) -> None:
@@ -1412,6 +1520,7 @@ class WorkflowEngine:
             "completed": "run.completed",
             "failed": "run.failed",
             "cancelled": "run.cancelled",
+            "interrupted": "run.interrupted",
             "rejected": "run.rejected",
         }.get(outcome.status, "run.parked")
         await self._emit(

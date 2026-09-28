@@ -882,6 +882,24 @@ class TestTimeTravel:
 class TestWebSocket:
     """Push updates, so a UI does not have to poll."""
 
+    def test_every_terminal_status_ends_a_stream(self) -> None:
+        """A terminal status the socket layer does not know about hangs a client.
+
+        ``TERMINAL_EVENTS`` and the engine's status vocabulary are maintained in
+        two files, and nothing forced them to agree. Adding a status on the
+        engine side alone is the easy mistake, and its symptom is not a crash: the
+        run ends, its event arrives, the subscription sees an event that is not
+        in the set it is filtering on, and the client holds a socket open
+        forever waiting for a close that will not come. No log line, no failing
+        test, one permanently wedged dashboard per interrupted run.
+
+        Asserted as an equality in both directions, so an event with no status
+        behind it is caught too.
+        """
+        from agentic_workflow.persistence.repository import TERMINAL_STATUSES
+
+        assert {f"run.{status}" for status in TERMINAL_STATUSES} == TERMINAL_EVENT_NAMES
+
     def test_a_run_stream_delivers_lifecycle_events(
         self, fast_ws: TestClient, request_factory: Any
     ) -> None:
