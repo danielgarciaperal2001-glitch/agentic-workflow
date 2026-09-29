@@ -175,10 +175,19 @@ class RateLimiter:
     add a dependency and a failure mode without improving correctness, because
     the ``max_parallel_runs`` ceiling already bounds the real resource.
 
+    Tracking every identity forever would be the other way to make the limiter
+    a liability, so it remembers at most
+    :data:`_RATE_LIMIT_TRACKED_CLIENTS` of them and forgets the rest. Which rest
+    is a correctness question rather than a memory one: forgetting a client
+    hands it a full budget, so the entry dropped has to be the one that has gone
+    longest without asking for anything. Dropping it by arrival instead would
+    make the limiter refund the busiest clients on a busy deployment, which is
+    the opposite of what it is for.
+
     Attributes:
         limit: Requests allowed per window. ``0`` disables the limiter.
         window: Window length in seconds.
-        hits: Per-key request timestamps, least-recent first.
+        hits: Per-key request timestamps, least-recently-used first.
     """
 
     def __init__(self, limit: int, window: float = 60.0) -> None:
@@ -211,6 +220,15 @@ class RateLimiter:
                 self.hits.popitem(last=False)
             self.hits[key] = deque([moment])
             return
+        # Moving the key is what makes the cap evict by recency of use rather
+        # than by arrival. Without it the dict is only ever written on a miss,
+        # so its order is the order clients first appeared in it, and the client
+        # that has been served most often is the one sitting furthest from the
+        # back — the first to be dropped, and refunded a full budget each time
+        # unrelated traffic pushes it out. A refused request counts as use: the
+        # client is still talking to us, and dropping its entry under sustained
+        # pressure is how a limiter becomes a counter the caller can reset.
+        self.hits.move_to_end(key)
         while bucket and moment - bucket[0] > self.window:
             bucket.popleft()
         if len(bucket) >= self.limit:
