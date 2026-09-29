@@ -349,7 +349,28 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------- ws  #
     ws_heartbeat_seconds: float = Field(default=20.0, gt=0.0, le=300.0)
     ws_send_timeout_seconds: float = Field(default=10.0, gt=0.0, le=120.0)
-    ws_max_connections_per_run: int = Field(default=16, ge=1, le=1024)
+    ws_max_connections_per_run: int = Field(
+        default=16,
+        ge=1,
+        le=1024,
+        description=(
+            "Observers allowed on one run. Bounds a single run's fan-out so a "
+            "busy dashboard cannot crowd out the operator watching a run that "
+            "is parked on a human decision."
+        ),
+    )
+    ws_max_connections_total: int = Field(
+        default=512,
+        ge=1,
+        le=100_000,
+        description=(
+            "Observers allowed across every run, including the wildcard "
+            "stream. The per-run cap counts one bucket, and the bucket key is "
+            "a run id the caller supplies, so without this a single client can "
+            "open as many sockets as it can invent run ids. Measured cost of "
+            "one live socket: ~39 KiB and one file descriptor."
+        ),
+    )
 
     # -------------------------------------------------------------- hitl  #
     hitl_enabled: bool = Field(
@@ -458,6 +479,14 @@ class Settings(BaseSettings):
             raise ValueError(
                 "postgres_pool_max_size must be >= postgres_pool_min_size "
                 f"(got {self.postgres_pool_max_size} < {self.postgres_pool_min_size})"
+            )
+        if self.ws_max_connections_total < self.ws_max_connections_per_run:
+            # A total below the per-run cap is not a stricter configuration, it
+            # is a dead one: every run would be refused at the total, and the
+            # per-run number would be a limit that never applied to anything.
+            raise ValueError(
+                "ws_max_connections_total must be >= ws_max_connections_per_run "
+                f"(got {self.ws_max_connections_total} < {self.ws_max_connections_per_run})"
             )
         if self.llm_provider is LLMProvider.OPENAI and not self.llm_api_key:
             raise ValueError(

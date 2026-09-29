@@ -121,7 +121,11 @@ async def _serve(websocket: WebSocket, run_id: str | None, token: str | None) ->
     try:
         sub = await hub.subscribe(bucket)
     except ConnectionLimitError as exc:
-        log.warning("ws.rejected", run_id=bucket, error=str(exc))
+        # `scope` is in the log because the two refusals need different
+        # responses from whoever is on call: a full run is a busy run, a full
+        # plane means clients are being turned away and somebody has to raise a
+        # limit or find the client holding the slots.
+        log.warning("ws.rejected", run_id=bucket, error=str(exc), **exc.context)
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=str(exc)[:120])
         return
 

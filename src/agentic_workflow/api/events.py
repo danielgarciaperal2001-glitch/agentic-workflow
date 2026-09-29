@@ -163,13 +163,18 @@ class EventHub:
         """Wire the hub.
 
         Args:
-            settings: Supplies the per-run connection limit.
+            settings: Supplies the per-run and total connection limits.
             queue_size: Per-subscriber queue depth.
         """
         self._settings = settings
         self._queue_size = max(1, queue_size)
         self._subscribers: dict[str, set[Subscription]] = {}
         self._counter = 0
+        # Running total, rather than a sum over the buckets, because the total
+        # is checked on every handshake and the sum is O(buckets) — which is
+        # exactly the quantity an attacker is inflating. `unsubscribe` is the
+        # only other writer, and `close` zeroes it.
+        self._live = 0
         self._published = 0
         self._delivered = 0
         self._dropped = 0
@@ -206,31 +211,61 @@ class EventHub:
 
     # ----------------------------------------------------------- subscribe #
     async def subscribe(self, run_id: str = ANY_RUN) -> Subscription:
-        """Register a subscriber.
+        """Register a subscriber, if both the bucket and the plane have room.
+
+        Two limits, because they answer different questions.
+        ``ws_max_connections_per_run`` bounds one run's fan-out, so a dashboard
+        cannot crowd out the operator watching a run parked on a human decision.
+        ``ws_max_connections_total`` bounds the process, and it is the one that
+        holds when a client spreads its sockets over invented run ids: the
+        bucket key is a string the caller supplies and the hub never checks it
+        against a run, so without a total the number of buckets is the caller's
+        to choose. Measured cost of one live socket on a real server: about
+        39 KiB and one file descriptor, linear in the count.
+
+        The wildcard bucket is subject to both, so a dashboard gains nothing by
+        not naming a run.
 
         Args:
-            run_id: Run to observe, or :data:`ANY_RUN` for every run. The cap
-                applies to per-run buckets; a wildcard subscription is limited by
-                the same number so a dashboard cannot bypass it either.
+            run_id: Run to observe, or :data:`ANY_RUN` for every run.
 
         Returns:
             The new :class:`Subscription`.
 
         Raises:
-            ConnectionLimitError: If the bucket is already at its limit.
+            ConnectionLimitError: If the bucket or the plane is at its limit.
         """
         async with self._lock:
-            bucket = self._subscribers.setdefault(run_id, set())
-            limit = self._settings.ws_max_connections_per_run
-            if len(bucket) >= limit:
+            bucket = self._subscribers.get(run_id, ())
+            per_run = self._settings.ws_max_connections_per_run
+            if len(bucket) >= per_run:
                 raise ConnectionLimitError(
-                    f"too many observers for {run_id!r} (limit {limit})",
+                    f"too many observers for {run_id!r} (limit {per_run})",
                     run_id=run_id,
-                    limit=limit,
+                    limit=per_run,
+                    scope="run",
                 )
+            total = self._settings.ws_max_connections_total
+            if self._live >= total:
+                # Both numbers travel with the refusal because the run id in the
+                # log is the one the client asked for, which is not necessarily
+                # the one at its limit. An operator who sees only the total
+                # cannot tell a full plane from a full run.
+                raise ConnectionLimitError(
+                    f"too many observers on this plane (limit {total})",
+                    run_id=run_id,
+                    limit=total,
+                    scope="total",
+                    total=total,
+                    per_run=per_run,
+                    subscribers=self._live,
+                )
+            if not bucket:
+                bucket = self._subscribers.setdefault(run_id, set())
             self._counter += 1
             sub = Subscription(run_id=run_id, key=self._counter)
             bucket.add(sub)
+            self._live += 1
             subscribers = len(bucket)
         log.info("hub.subscribed", run_id=run_id, subscribers=subscribers)
         return sub
@@ -243,8 +278,9 @@ class EventHub:
         """
         async with self._lock:
             bucket = self._subscribers.get(sub.run_id)
-            if bucket is not None:
+            if bucket is not None and sub in bucket:
                 bucket.discard(sub)
+                self._live -= 1
                 if not bucket:
                     del self._subscribers[sub.run_id]
         log.info("hub.unsubscribed", run_id=sub.run_id, dropped=sub.dropped)
@@ -253,6 +289,9 @@ class EventHub:
         """Drop every subscriber. Used on shutdown."""
         async with self._lock:
             self._subscribers.clear()
+            # The count is what the total cap reads, so leaving it behind would
+            # leave a plane that is permanently full after a restart-in-place.
+            self._live = 0
 
     # -------------------------------------------------------------- stats #
     def subscriber_count(self, run_id: str | None = None) -> int:
@@ -279,15 +318,21 @@ class EventHub:
     def stats(self) -> dict[str, Any]:
         """Return counters for the readiness probe and the metrics endpoint.
 
+        The subscriber total is reported next to the cap it is measured against.
+        A count on its own cannot distinguish a plane at capacity from a quiet
+        one, and that is the difference between raising a limit and hunting for
+        the client holding the slots.
+
         Returns:
-            Published / delivered / dropped event counts, subscriber totals and
-            the current UTC timestamp.
+            Published / delivered / dropped event counts, subscriber totals, the
+            two connection caps and the current UTC timestamp.
         """
         return {
             "published": self._published,
             "delivered": self._delivered,
             "dropped": self._dropped,
             "subscribers": self.subscriber_count(),
+            "subscribers_max": self._settings.ws_max_connections_total,
             "runs_observed": len(self.observed_runs()),
             "ts": utcnow().isoformat(),
         }

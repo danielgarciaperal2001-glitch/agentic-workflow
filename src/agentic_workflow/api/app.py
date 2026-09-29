@@ -344,7 +344,14 @@ def _render_metrics(payload: dict[str, Any]) -> Response:
     """
     flat: dict[str, float] = {}
     counters: dict[str, Any] = payload.get("events") or {}
-    for key in ("published", "delivered", "dropped", "subscribers", "runs_observed"):
+    for key in (
+        "published",
+        "delivered",
+        "dropped",
+        "subscribers",
+        "subscribers_max",
+        "runs_observed",
+    ):
         if key in counters:
             flat[f"awf_events_{key}"] = float(counters[key])
     flat["awf_runs_registered"] = float(payload.get("runs", 0))

@@ -156,6 +156,15 @@ Then, in order:
    names the offending field.
 3. **`RateLimitExceeded`** (429) — `AWF_API_RATE_LIMIT_PER_MINUTE` is too low for
    your client, or something is looping.
+4. **A WebSocket handshake answered 403** — an observer cap was reached. The
+   `ws.rejected` log line says which one: `scope=run` is
+   `AWF_WS_MAX_CONNECTIONS_PER_RUN` and is normal on a dashboard-heavy
+   deployment, `scope=total` is `AWF_WS_MAX_CONNECTIONS_TOTAL` and means clients
+   are being turned away. `awf_events_subscribers` against
+   `awf_events_subscribers_max` on `/metrics` shows which side you are on. A
+   total refusal is worth asking about rather than only raising: each live
+   socket costs about 39 KiB and one file descriptor, and a client that opens
+   one per run id it invents is reaching the cap without watching anything.
 
 ### Postgres-backed runs cannot be read
 
@@ -437,6 +446,8 @@ Everything is `AWF_`-prefixed. The ones worth knowing by heart:
 | `AWF_API_RATE_LIMIT_PER_MINUTE` | `120` | Per-client request budget. |
 | `AWF_API_TRUST_FORWARDED_FOR` | `false` | Key the limiter on `X-Forwarded-For`. Only behind a proxy that overwrites it. |
 | `AWF_API_CORS_ORIGINS` | `http://localhost:3000` | Browser origins allowed to call the API. |
+| `AWF_WS_MAX_CONNECTIONS_PER_RUN` | `16` | Observers on one run. |
+| `AWF_WS_MAX_CONNECTIONS_TOTAL` | `512` | Observers across every run. Must be `>=` the per-run cap. |
 | `AWF_LOG_FORMAT` | `console` | `json` for machine-readable logs. |
 
 The two rows that decide whether the plane is a control plane or a public
