@@ -16,6 +16,22 @@ The connection is intentionally *lossy but never wrong*:
 * The first frame after ``accept`` is a *snapshot*, not a change. A stream that
   only reports deltas leaves a late subscriber with no idea where the run
   currently is.
+
+The first property is the one a client has to be able to *act* on, so a loss is
+reported on the wire. When this client falls behind and the hub discards events
+for it, the next frame is a heartbeat carrying ``dropped_since_last``: how many
+events it missed since the last one it was told about. The client re-fetches
+the run over REST and carries on.
+
+It rides the heartbeat event name and is emitted as soon as the loss is
+noticed, not on the next idle tick. Both choices are load-bearing. A client
+that has never heard of the field handles the frame as the heartbeat it already
+knows, which is what lets a server ship it ahead of the front-ends. And
+waiting for idle would inform nobody who needed it: a queue is full *because*
+the reader fell behind, and a full queue is precisely the state in which the
+idle tick never comes. Measured with a five-second idle interval, the notice
+arrives in about seven milliseconds — the first frame on the socket, ahead of
+any queued event.
 """
 
 from __future__ import annotations
@@ -205,6 +221,27 @@ async def _pump(
         WebSocketDisconnect: If the client vanished or a send timed out.
     """
     while True:
+        # The loss notice is emitted here, before the next queued event and
+        # without waiting for the idle interval, and that placement is the whole
+        # point. A queue is full *because* the reader fell behind, and a full
+        # queue makes `get` return immediately every time — so the idle
+        # heartbeat never fires for exactly the client that needs telling.
+        # Piggybacking on idle would inform the dashboards that are keeping up
+        # and stay silent to the one that lost 144 events.
+        #
+        # It rides the heartbeat event name rather than introducing a new one:
+        # a client older than this field sees a heartbeat it already handles
+        # and ignores the rest, so the recovery guidance ("re-fetch over REST")
+        # can ship to a server whose front-ends predate it.
+        lost = sub.take_loss()
+        if lost:
+            await _send(
+                websocket,
+                {"event": "heartbeat", "dropped_since_last": lost},
+                send_timeout,
+            )
+            log.info("ws.events_dropped", run_id=sub.run_id, dropped=lost)
+
         event = await sub.get(timeout=heartbeat)
         if event is None:
             await _send(websocket, {"event": "heartbeat"}, send_timeout)

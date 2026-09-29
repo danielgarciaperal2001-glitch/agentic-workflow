@@ -125,12 +125,38 @@ class Subscription:
         default_factory=lambda: asyncio.Queue(maxsize=DEFAULT_QUEUE_SIZE)
     )
     dropped: int = 0
+    #: Loss the reader has not been told about yet. Distinct from ``dropped``,
+    #: which is a running total for the logs: a notice is a delta, and it is
+    #: consumed by whoever delivers it, so the two cannot be the same field.
+    _untold: int = field(default=0, repr=False)
     key: int = 0
 
     @property
     def is_wildcard(self) -> bool:
         """Whether this subscriber observes every run."""
         return self.run_id == ANY_RUN
+
+    def take_loss(self) -> int:
+        """Collect the losses this client has not been told about, and reset them.
+
+        The delta rather than the running total, because the client's question
+        is "how much did I miss since you last spoke", and a client that
+        reconnects — the normal way to recover — has no baseline to difference a
+        cumulative count against.
+
+        Consumed rather than read, so a notice is delivered exactly once. The
+        loss is noticed by the writer and delivered by the reader, which are
+        different tasks: a client that is mid-frame when the drop happens is
+        precisely the client that dropped events, so the notice has to survive
+        until somebody collects it.
+
+        Returns:
+            How many events were lost since the previous call, or ``0`` when
+            nothing has been lost. The caller leaves the field off the frame
+            entirely in that case, rather than sending a zero nobody needs.
+        """
+        lost, self._untold = self._untold, 0
+        return lost
 
     async def get(self, *, timeout: float) -> dict[str, Any] | None:
         """Await the next event.
@@ -176,6 +202,7 @@ class Subscription:
             with suppress(asyncio.QueueEmpty):
                 self.queue.get_nowait()
             self.dropped += 1
+            self._untold += 1
             try:
                 self.queue.put_nowait(event)
             except asyncio.QueueFull:  # pragma: no cover - only under a reentrant send

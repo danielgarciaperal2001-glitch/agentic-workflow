@@ -183,6 +183,25 @@ Frames are `{"event": ..., "run_id": ..., "data": ...}`. The event sink is wired
 unconditionally in `create_app`, including for an injected engine, so a connected
 client receives events rather than completing a handshake and hearing nothing.
 
+**The stream is lossy on purpose, and tells you when it is.** Each client gets a
+bounded queue, and a client that reads slower than events arrive loses the
+*oldest* ones rather than applying backpressure to a running workflow. When that
+happens the next frame is a heartbeat carrying how many events were missed:
+
+```json
+{"event": "heartbeat", "dropped_since_last": 12}
+```
+
+Re-fetch the run over REST and carry on — the stream is notifications, the run
+state is the source of truth. Do not use the per-event `seq` field to detect
+this: it counts publications across *all* runs, so the gaps in it belong to
+other runs, and because the loss is always the oldest event it lands at the head
+of the queue where no gap appears at all.
+
+It rides the `heartbeat` event name, so a client that ignores the field keeps
+working unchanged, and it arrives as soon as the loss happens rather than on the
+next idle tick — a client that fell behind is the one that never goes idle.
+
 ## The audit log
 
 Every decision is appended, never updated:

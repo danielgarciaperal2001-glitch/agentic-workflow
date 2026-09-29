@@ -165,6 +165,15 @@ Then, in order:
    total refusal is worth asking about rather than only raising: each live
    socket costs about 39 KiB and one file descriptor, and a client that opens
    one per run id it invents is reaching the cap without watching anything.
+5. **A dashboard went stale, or shows a run jumping between states** — the
+   socket's bounded queue overflowed and the client was told: look for
+   `awf_events_dropped` climbing on `/metrics`, and for `ws.events_dropped` in
+   the log, which carries the per-client count. The stream drops the *oldest*
+   events for a reader that cannot keep up, by design, and reports the loss on
+   the next frame as `dropped_since_last`. Nothing is wrong with the run; the
+   client re-fetches over REST. If this fires constantly, the reader is the
+   problem — usually a client subscribed to `/ws/events` from every one of a
+   fleet of tabs, where a single wildcard socket would do.
 
 ### Postgres-backed runs cannot be read
 

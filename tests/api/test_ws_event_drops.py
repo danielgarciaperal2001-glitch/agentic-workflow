@@ -36,13 +36,16 @@ The tests below pin the counter as a measurement, and audit the rest of
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 import re
 
 from fastapi.testclient import TestClient
 import pytest
 
 from agentic_workflow.api.app import create_app
-from agentic_workflow.api.events import ANY_RUN, EventHub
+from agentic_workflow.api.events import ANY_RUN, EventHub, PutResult
+from agentic_workflow.api.routers.events import _pump
 from agentic_workflow.config import Settings
 
 pytestmark = pytest.mark.api
@@ -281,7 +284,7 @@ class TestTheOtherCounters:
         class Exploding:
             """A subscriber that fails on every send, like a dead socket."""
 
-            def put(self, event: dict[str, object]) -> bool:
+            def put(self, event: dict[str, object]) -> PutResult:
                 """Fail the way a broken socket would.
 
                 Args:
@@ -302,3 +305,202 @@ class TestTheOtherCounters:
         # fail-safe: one broken subscriber must not wedge the event path.
         assert hub.stats()["published"] == 0, "the swallowed event is not counted"
         assert hub.subscriber_count("run-1") == 1
+
+
+class TestTheClientIsTold:
+    """A client that lost events has to be able to find out, from the stream.
+
+    Counting the loss is only half of it. The hub's contract is that events are
+    notifications and REST is the source of truth, so a dropped event costs a
+    client latency rather than correctness — but that recovery is advice a
+    client can only act on if it knows it dropped something. Before this, a
+    client had no way to learn it: ``seq`` is a global publication counter, so
+    the gaps it sees belong to other runs (measured: ``[0, 1, 4]`` with zero
+    drops), and because the loss is always the *oldest* event it lands at the
+    head of the queue, leaving ``seq`` contiguous straight across it (measured:
+    144 lost events, ``144..399``, no hole at all).
+
+    The notice rides on the heartbeat channel rather than as a new event type.
+    A client that does not know the field sees a heartbeat it already handles,
+    which is what makes this safe to ship to deployments whose front-ends are
+    older than the server.
+
+    One property is load-bearing and easy to get wrong, so it is pinned
+    separately: the client that most needs telling is the one whose queue is
+    *full*, and a full queue means the idle heartbeat never fires. An idle-only
+    notice would therefore reach exactly the clients that are keeping up, and
+    never the one that fell behind.
+    """
+
+    async def test_a_loss_is_reported_on_the_heartbeat_channel(self) -> None:
+        """A heartbeat following a loss carries how many events it missed.
+
+        The count has to be there, not just the fact of the loss: a client
+        deciding whether to re-fetch the whole run state or just wait depends on
+        whether it missed one event or two hundred.
+        """
+        hub = EventHub(_settings())
+        sub = await hub.subscribe("run-1")
+
+        for step in range(QUEUE * 2):
+            await hub.publish({"event": "node.completed", "run_id": "run-1", "step": step})
+
+        missed = sub.take_loss()
+        assert missed == QUEUE
+        assert sub.take_loss() == 0, "the notice is consumed, so it is not repeated"
+
+    async def test_a_client_that_keeps_up_is_never_told_it_lost_nothing(self) -> None:
+        """A healthy stream reports zero, and the field is left off entirely.
+
+        Sending ``dropped_since_last: 0`` on every idle heartbeat would be noise
+        on the busiest socket in the fleet, and it would train a client to
+        ignore the field — which is how the real value stops being noticed.
+        """
+        hub = EventHub(_settings())
+        sub = await hub.subscribe("run-1")
+
+        for step in range(10):
+            await hub.publish({"event": "node.completed", "run_id": "run-1", "step": step})
+
+        assert sub.take_loss() == 0
+
+    async def test_two_bursts_report_separately_rather_than_cumulatively(self) -> None:
+        """Each notice covers only the losses since the previous one.
+
+        A cumulative count would force the client to keep its own baseline to
+        work out what changed, and a client that reconnects — the normal way to
+        recover — would have no baseline at all.
+        """
+        hub = EventHub(_settings())
+        sub = await hub.subscribe("run-1")
+
+        for step in range(QUEUE * 2):
+            await hub.publish({"event": "node.completed", "run_id": "run-1", "step": step})
+        first = sub.take_loss()
+
+        # Drain, so the queue has depth again and the next burst is a real burst.
+        while not sub.queue.empty():
+            sub.queue.get_nowait()
+        for step in range(QUEUE * 2):
+            await hub.publish({"event": "node.completed", "run_id": "run-1", "step": step})
+        second = sub.take_loss()
+
+        assert first == QUEUE
+        assert second == QUEUE, "the second burst is the second burst, not the sum"
+
+    async def test_the_notice_waits_for_the_reader_rather_than_being_lost_itself(self) -> None:
+        """A pending notice survives until the reader actually collects it.
+
+        The drop is noticed by the *writer* and told by the *reader*, and those
+        are two different tasks. If the notice were consumed at drop time it
+        would be discarded unread whenever the reader was mid-frame — which is
+        precisely the state a lagging reader is in.
+        """
+        hub = EventHub(_settings())
+        sub = await hub.subscribe("run-1")
+
+        for step in range(QUEUE * 2):
+            await hub.publish({"event": "node.completed", "run_id": "run-1", "step": step})
+
+        assert sub.dropped == QUEUE, "the total keeps counting"
+        assert sub.take_loss() == QUEUE
+        assert sub.dropped == QUEUE, "and collecting the notice does not zero it"
+
+
+class _FakeSocket:
+    """A socket that records frames and never applies backpressure.
+
+    Deliberately does not block on ``send_text``: a real slow client is slow at
+    the OS layer, and a fake that blocked here would deadlock the pump instead
+    of modelling it.
+    """
+
+    def __init__(self) -> None:
+        """Start with no frames sent."""
+        self.frames: list[dict[str, object]] = []
+        self.url = type("Url", (), {"path": "/ws/runs/run-1"})()
+
+    async def send_text(self, frame: str) -> None:
+        """Record one JSON frame.
+
+        Args:
+            frame: The serialised frame.
+        """
+        import json
+
+        self.frames.append(json.loads(frame))
+
+
+class TestTheNoticeIsForced:
+    """The notice cannot wait for an idle heartbeat, because there is no idle.
+
+    A subscriber's queue is full *because* it fell behind, and a full queue
+    means ``sub.get`` returns immediately every time — so the idle heartbeat
+    never fires for exactly the client that needs telling. Delivering the
+    notice only on idle would reach the clients that are keeping up and never
+    the one that lost 144 events, which is the failure mode this design has to
+    avoid rather than merely improve on.
+    """
+
+    async def test_a_backlogged_reader_is_told_without_waiting_for_idle(self) -> None:
+        """The notice arrives while the queue is still full.
+
+        The heartbeat interval is a full second here, so an implementation that
+        waited for idle would need that second to pass. The assertion does not
+        depend on timing: the socket is still being pumped and the notice is
+        already there.
+        """
+        hub = EventHub(_settings())
+        sub = await hub.subscribe("run-1")
+        for step in range(QUEUE * 2):
+            await hub.publish({"event": "node.completed", "run_id": "run-1", "step": step})
+        assert not sub.queue.empty(), "the reader is backlogged, not idle"
+
+        socket = _FakeSocket()
+        pump = asyncio.create_task(_pump(socket, sub, heartbeat=1.0, send_timeout=1.0))  # type: ignore[arg-type]
+        try:
+            for _ in range(200):
+                await asyncio.sleep(0)
+                if any("dropped_since_last" in f for f in socket.frames):
+                    break
+        finally:
+            pump.cancel()
+            with suppress(asyncio.CancelledError):
+                await pump
+
+        notices = [f for f in socket.frames if "dropped_since_last" in f]
+        assert notices, (
+            "a backlogged reader must be told immediately, not on the next idle "
+            f"heartbeat; frames seen: {[f.get('event') for f in socket.frames[:5]]}"
+        )
+        assert notices[0]["dropped_since_last"] == QUEUE
+        # It rides the heartbeat event, so a client that has never heard of the
+        # field handles it as the frame it already knows.
+        assert notices[0]["event"] == "heartbeat"
+
+    async def test_a_healthy_reader_is_never_sent_the_field(self) -> None:
+        """No loss means no field, on a socket that is pumping normally.
+
+        The mirror of the test above, so a fix cannot simply always send the
+        notice and satisfy both.
+        """
+        hub = EventHub(_settings())
+        sub = await hub.subscribe("run-1")
+        for step in range(5):
+            await hub.publish({"event": "node.completed", "run_id": "run-1", "step": step})
+
+        socket = _FakeSocket()
+        pump = asyncio.create_task(_pump(socket, sub, heartbeat=0.01, send_timeout=1.0))  # type: ignore[arg-type]
+        try:
+            for _ in range(50):
+                await asyncio.sleep(0)
+        finally:
+            pump.cancel()
+            with suppress(asyncio.CancelledError):
+                await pump
+
+        assert socket.frames, "the pump must have delivered the events at all"
+        assert all("dropped_since_last" not in f for f in socket.frames)
+        assert all(f.get("event") != "heartbeat" for f in socket.frames), (
+            "an idle socket still gets heartbeats, but never a zero-loss notice"
+        )
