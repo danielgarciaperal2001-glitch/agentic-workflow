@@ -16,7 +16,12 @@ most likely to take the whole service down:
    unsubscribes immediately instead of retrying against a closed socket.
 3. **Events are notifications, not the source of truth.** Every event can be
    recovered over REST, so dropping one degrades the UI's latency, never its
-   correctness. That is what makes lossy delivery acceptable.
+   correctness. That is what makes lossy delivery acceptable — but it holds
+   only for a client that can *tell* it dropped something, which is why the
+   losses are counted: per subscription in :attr:`Subscription.dropped`, and
+   process-wide as ``awf_events_dropped``. A drop that is neither counted nor
+   reported leaves a frozen dashboard indistinguishable from a healthy one,
+   and the recovery in point 3 becomes advice the client has no way to act on.
 
 Subscribers register under a run id, or under :data:`ANY_RUN` to observe every
 run at once (dashboards). A wildcard subscriber receives the union of all
@@ -32,7 +37,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
 from agentic_workflow.config import Settings
 from agentic_workflow.domain.schemas import utcnow
@@ -73,6 +78,25 @@ class ConnectionLimitError(WorkflowError):
         """
         self.retryable = True
         super().__init__(message, **context)
+
+
+class PutResult(NamedTuple):
+    """What one enqueue attempt did to a subscriber's queue.
+
+    The two fields are independent by design. Under the drop-oldest policy a
+    full queue both discards an event and accepts the new one, so any single
+    return value loses half of what happened: a bool that means "enqueued"
+    cannot report the loss, and a loss count cannot report whether the new
+    event arrived. :meth:`Subscription.put` returns this so the hub can keep
+    ``awf_events_delivered`` and ``awf_events_dropped`` each honest.
+
+    Attributes:
+        enqueued: Whether the new event reached the queue.
+        lost: How many queued events were discarded to make room.
+    """
+
+    enqueued: bool
+    lost: int
 
 
 #: ``eq=False`` is load-bearing, not a style choice. The hub holds subscribers in
@@ -123,17 +147,29 @@ class Subscription:
         except TimeoutError:
             return None
 
-    def put(self, event: dict[str, Any]) -> bool:
+    def put(self, event: dict[str, Any]) -> PutResult:
         """Enqueue an event, dropping the oldest one if the reader is behind.
 
         Args:
             event: The event to deliver.
 
         Returns:
-            ``True`` if it was enqueued, ``False`` if the queue was still full.
+            Whether the new event reached the queue, and how many events were
+            discarded to make room for it. Both facts are needed and neither
+            implies the other.
+
+            This used to return a single ``True`` for "the event was enqueued",
+            which cannot express what actually happened: dropping the oldest
+            event and enqueueing the new one is a successful put *and* a lost
+            event. The caller counted losses only when the return was ``False``
+            — a reentrant send marked ``pragma: no cover`` — so the hub's
+            dropped total was structurally pinned at zero under the drop-oldest
+            policy. That total is what ``awf_events_dropped`` reports, and it
+            was answering zero while subscribers were losing events.
         """
         try:
             self.queue.put_nowait(event)
+            return PutResult(enqueued=True, lost=0)
         except asyncio.QueueFull:
             # Drop-oldest, not drop-newest: the newest event is the one a UI
             # needs most in order to converge on the right state.
@@ -143,8 +179,8 @@ class Subscription:
             try:
                 self.queue.put_nowait(event)
             except asyncio.QueueFull:  # pragma: no cover - only under a reentrant send
-                return False
-        return True
+                return PutResult(enqueued=False, lost=1)
+            return PutResult(enqueued=True, lost=1)
 
 
 class EventHub:
@@ -200,10 +236,15 @@ class EventHub:
 
             delivered = 0
             for sub in targets:
-                if sub.put(payload):
+                # A slow subscriber loses its oldest queued event *and* receives
+                # the new one. Both hold at once, which is why `put` reports
+                # them separately: the enqueue succeeding is not evidence that
+                # nothing was lost, and a loss is not evidence that the enqueue
+                # failed.
+                result = sub.put(payload)
+                if result.enqueued:
                     delivered += 1
-                else:
-                    self._dropped += 1
+                self._dropped += result.lost
             self._published += 1
             self._delivered += delivered
         except Exception as exc:  # an observability bug must not fail a run
@@ -338,4 +379,11 @@ class EventHub:
         }
 
 
-__all__ = ["ANY_RUN", "DEFAULT_QUEUE_SIZE", "ConnectionLimitError", "EventHub", "Subscription"]
+__all__ = [
+    "ANY_RUN",
+    "DEFAULT_QUEUE_SIZE",
+    "ConnectionLimitError",
+    "EventHub",
+    "PutResult",
+    "Subscription",
+]
