@@ -101,9 +101,14 @@ async def _serve(websocket: WebSocket, run_id: str | None, token: str | None) ->
     """
     try:
         websocket_auth(websocket, token)
-    except WebSocketDisconnect:
+    except WebSocketDisconnect as refusal:
         # Rejected before the handshake completes, which is the only way to
-        # refuse a WebSocket: the client observes a 1008 close.
+        # refuse a WebSocket. The refusal still has to be *sent*: returning
+        # without accepting or closing leaves the ASGI server to invent an
+        # answer, and the one uvicorn invents is a 500 with an ERROR line, so
+        # every wrong token looked like an outage and the 1008 this code
+        # documented was never delivered to anyone.
+        await _refuse(websocket, refusal)
         return
 
     hub: EventHub | None = getattr(websocket.app.state, "hub", None)
@@ -146,6 +151,35 @@ async def _serve(websocket: WebSocket, run_id: str | None, token: str | None) ->
         log.info("ws.closed", run_id=bucket, dropped=sub.dropped)
         with suppress(RuntimeError, WebSocketDisconnect):
             await websocket.close()
+
+
+async def _refuse(websocket: WebSocket, refusal: WebSocketDisconnect) -> None:
+    """Complete a rejected handshake, so the server stops inventing an answer.
+
+    A socket that was never accepted has no frame to close, so a refusal is
+    carried by the upgrade request's HTTP response and the server chooses its
+    status. Closing before accept is how this says "no": uvicorn turns it into a
+    403 and keeps its own log at INFO, which is what the capacity limit below
+    already does.
+
+    The alternative is the ``websocket.http.response`` extension, which would let
+    this answer 401 with the same ``WWW-Authenticate`` challenge the HTTP path
+    returns. It was measured against uvicorn 0.54 and rejected: the client got the
+    right status, and the server still wrote ``ERROR  ASGI callable returned
+    without completing handshake`` for every refusal, because that
+    implementation only marks the handshake finished on accept or close. A
+    deployment whose error log fills with ERROR lines because someone guessed a
+    token is the situation this function exists to prevent, and a browser — the
+    client this endpoint is written for — cannot read the status either way. The
+    reason survives in the ``ws.auth_failed`` line, which is where an operator
+    looks for it.
+
+    Args:
+        websocket: The socket being refused, still in the connecting state.
+        refusal: The exception raised by the authentication check.
+    """
+    with suppress(RuntimeError, WebSocketDisconnect):
+        await websocket.close(code=refusal.code, reason=refusal.reason)
 
 
 async def _pump(
