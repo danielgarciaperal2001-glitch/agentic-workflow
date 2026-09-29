@@ -243,6 +243,63 @@ class TestResume:
         # The refusal must leave the run exactly where the first decision left it.
         assert (await engine.status(first.run_id)).is_parked is True
 
+    async def test_a_duplicate_that_overlaps_is_refused_as_the_cause_it_is(
+        self, engine: WorkflowEngine
+    ) -> None:
+        """A double-click is refused for the same reason as a late retry.
+
+        The test above covers a duplicate that arrives *after* the first resolve
+        finished. A double-click, a retried timeout and a redelivered queue
+        message all arrive *while* the first is still in flight, and that path
+        asked a different question. ``resume`` reads the checkpointer, sees the
+        gate still pending, clears the decision log, and only then claims the run
+        in :meth:`_admit`. Both requests can therefore be past every check when
+        the second one finds the run claimed, and what it reported was
+        ``run_already_exists`` — the code for *this run id is taken*, which is
+        what a duplicate ``POST /v1/runs`` gets. Same string, same 409, and it
+        points a client at a naming collision that does not exist instead of at
+        the decision it just sent.
+
+        Worse, the answer was not even stable. Measured over 30 rounds through
+        the HTTP API with the two requests genuinely overlapping: 25 answered
+        ``run_already_exists`` and 5 answered ``approval_already_resolved``,
+        depending on whether the loser lost the race before or after the winner
+        wrote the decision it was about to look for. A client cannot implement
+        the right response to a code that appears one time in six.
+
+        The refusal is the same *kind* of refusal either way — one decision is
+        applied and the second is not, and ``_admit`` is what makes claiming
+        atomic, so the audit trail was never wrong. What is being pinned here is
+        that the losing request names that truth, because the answer is the only
+        thing a client has to go on.
+        """
+        first = await engine.start(make_request())
+        answered = _decide(first.pending)
+        assert first.is_parked and first.pending is not None
+
+        results = await asyncio.gather(
+            engine.resume(first.run_id, dict(answered)),
+            engine.resume(first.run_id, dict(answered)),
+            return_exceptions=True,
+        )
+
+        accepted = [r for r in results if not isinstance(r, BaseException)]
+        refused = [r for r in results if isinstance(r, ApprovalAlreadyResolvedError)]
+        other = [
+            r
+            for r in results
+            if isinstance(r, BaseException) and not isinstance(r, ApprovalAlreadyResolvedError)
+        ]
+
+        assert other == [], f"the loser must be refused as a replay, not as {other}"
+        assert len(accepted) == 1, "exactly one resolve may be applied"
+        assert len(refused) == 1, "exactly one resolve may be refused"
+        assert refused[0].context["approval_id"] == answered["approval_id"]
+        assert refused[0].run_id == first.run_id
+        # One decision in the log, whichever request won the claim.
+        final = await engine.status(first.run_id)
+        assert [d["approval_id"] for d in final.decisions] == [answered["approval_id"]]
+
     async def test_run_until_done_converges(self, engine: WorkflowEngine) -> None:
         """Answering every gate terminates the run in a bounded number of steps.
 
@@ -1005,7 +1062,17 @@ class TestConcurrency:
             first = asyncio.create_task(engine.resume(parked.run_id, _approve(parked.pending)))
             await asyncio.wait_for(inside.wait(), timeout=10)
 
-            with pytest.raises(RunAlreadyExistsError):
+            # The refusal is a *replay* refusal, not a run-id collision. This
+            # assertion was `RunAlreadyExistsError`, and it was wrong for the
+            # reason the neighbouring test spells out: on a resume, finding the
+            # run already claimed can only mean a sibling resume is applying a
+            # decision to this gate. What this test protects — one drive, no
+            # orphaned task, no double-apply — is enforced by `_admit` and is
+            # unaffected by which error names it, so the class is asserted
+            # explicitly rather than loosened to a bare `Exception`: the
+            # over-broad match would pass again if the refusal silently
+            # regressed to an unrelated failure.
+            with pytest.raises(ApprovalAlreadyResolvedError):
                 await engine.resume(parked.run_id, _approve(parked.pending))
 
             # The refusal must not have disturbed the run that legitimately owns

@@ -541,7 +541,48 @@ class WorkflowEngine:
                 status=outcome.status,
             )
         self._refuse_replayed_decision(outcome, decision)
-        return await self._drive(None, context=context, resume=decision, run_id=run_id)
+        try:
+            return await self._drive(None, context=context, resume=decision, run_id=run_id)
+        except RunAlreadyExistsError as exc:
+            # Reaching here means the run was parked when this request read the
+            # checkpointer, and by the time it claimed the run another request
+            # had claimed it. Every check above this point is a read, so two
+            # duplicates of the same decision can both pass them; `_admit` is
+            # what makes claiming atomic, and its refusal is the honest answer
+            # here. It was not the honest *code*, though.
+            #
+            # `_admit` raises `RunAlreadyExistsError` because from inside the
+            # driver a claimed run means "this run id is in flight, do not drive
+            # it twice", which is exactly right for a duplicate `POST /v1/runs`.
+            # On this path that reading is wrong: the run id is not in conflict,
+            # a sibling request is mid-resume of the gate this decision answers.
+            # Reporting it sent a client looking for a naming collision — the
+            # same code, the same 409, and the same string a duplicate run
+            # creation returns — when the truth was that its decision had been
+            # applied, which is what the sequential duplicate already reports.
+            #
+            # Which of the two codes came back also depended on how far the
+            # winner had got: 25 of 30 overlapping rounds answered
+            # `run_already_exists` and 5 answered `approval_already_resolved`,
+            # the latter when the loser arrived late enough to find the decision
+            # in the log. Same mistake, same request, two answers, so the loser
+            # is named here the same way the late loser is.
+            #
+            # The one case this over-answers is a `replay_from` branch in flight
+            # on the same run: the decision really was not applied. It is also
+            # not a gate awaiting an answer, and the recovery is the same — read
+            # the run's current state — so the imprecision costs the client
+            # nothing it can act on. Distinguishing it would mean tracking which
+            # kind of drive owns the run, which is not worth a field whose only
+            # use is this message.
+            # `from exc` rather than `from None`: the driver still refused, and a
+            # log reader debugging a refused resume wants to see that it was
+            # `_admit` that said no. What the client reads is the envelope above.
+            raise ApprovalAlreadyResolvedError(
+                "a decision for this run is already being applied",
+                approval_id=_approval_id_of(decision),
+                run_id=run_id,
+            ) from exc
 
     @staticmethod
     def _refuse_replayed_decision(
@@ -569,11 +610,7 @@ class WorkflowEngine:
         Raises:
             ApprovalAlreadyResolvedError: If the approval was already answered.
         """
-        approval_id = (
-            decision.approval_id
-            if isinstance(decision, ApprovalDecision)
-            else str(decision.get("approval_id", ""))
-        )
+        approval_id = _approval_id_of(decision)
         for entry in outcome.decisions:
             if entry.get("approval_id") == approval_id:
                 raise ApprovalAlreadyResolvedError(
@@ -1780,6 +1817,25 @@ def _resume_value(resume: ApprovalDecision | dict[str, Any]) -> Any:
     if isinstance(resume, ApprovalDecision):
         return resume.model_dump(mode="json")
     return resume
+
+
+def _approval_id_of(decision: ApprovalDecision | dict[str, Any]) -> str:
+    """Read the gate a decision answers, from either accepted shape.
+
+    Both replay refusals need it — the one that finds the decision in the log
+    and the one that loses the claim on the run — and they must agree on which
+    gate is meant, so the extraction lives here rather than twice.
+
+    Args:
+        decision: The decision, as a model or a client payload.
+
+    Returns:
+        The approval id, or ``""`` when a raw payload omits it. A refusal with
+        an empty id is still a refusal; it just cannot name the gate.
+    """
+    if isinstance(decision, ApprovalDecision):
+        return decision.approval_id
+    return str(decision.get("approval_id", ""))
 
 
 def _checkpoint_id(snap: Any) -> str | None:
