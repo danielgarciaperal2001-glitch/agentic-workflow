@@ -20,6 +20,7 @@ Example:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Final
 
 from fastapi import FastAPI, Request, status
@@ -107,6 +108,7 @@ def error_response(
     exc: WorkflowError,
     *,
     http_status: int | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> JSONResponse:
     """Render a :class:`WorkflowError` as the canonical error envelope.
 
@@ -117,6 +119,11 @@ def error_response(
             HTTP contract differs from the default mapping — for example a
             rejected approval, which is a 200 because the *rejection* is the
             successful outcome of a review.
+        headers: Response headers the raiser attached to the exception. They are
+            kept because the envelope replaces the raiser's own response: a
+            ``WWW-Authenticate`` challenge attached to a 401 is the only thing
+            that tells a client what to send next, and rebuilding the response
+            without it turned a usable refusal into a dead end.
 
     Returns:
         A :class:`~fastapi.responses.JSONResponse` carrying the envelope and, for
@@ -127,7 +134,7 @@ def error_response(
         "error": exc.to_dict(),
         "request_id": getattr(request.state, "request_id", None),
     }
-    headers: dict[str, str] = {}
+    response_headers: dict[str, str] = dict(headers or {})
     if exc.retryable:
         # Advertising `Retry-After` on every retryable error would be noise, but
         # on the ones with a real backoff it lets a generic client behave. The
@@ -135,7 +142,7 @@ def error_response(
         # rolls over, and a client that honours a pessimistic "1" retries early
         # and is throttled again.
         computed = exc.context.get("retry_after_seconds")
-        headers["Retry-After"] = str(int(float(computed)) + 1 if computed else 1)
+        response_headers.setdefault("Retry-After", str(int(float(computed)) + 1 if computed else 1))
     level = log.warning if status_code < 500 else log.error
     level(
         "api.error",
@@ -145,7 +152,7 @@ def error_response(
         request_id=body["request_id"],
         error=str(exc),
     )
-    return JSONResponse(status_code=status_code, content=body, headers=headers)
+    return JSONResponse(status_code=status_code, content=body, headers=response_headers)
 
 
 def install_error_handlers(app: FastAPI) -> None:
@@ -215,7 +222,9 @@ def install_error_handlers(app: FastAPI) -> None:
             code=code,
             status_code=exc.status_code,
         )
-        return error_response(request, error, http_status=exc.status_code)
+        return error_response(
+            request, error, http_status=exc.status_code, headers=exc.headers or {}
+        )
 
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
