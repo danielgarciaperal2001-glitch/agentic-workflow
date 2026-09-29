@@ -359,7 +359,6 @@ SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
 EngineDep = Annotated[WorkflowEngine, Depends(get_engine)]
 ApprovalsDep = Annotated[ApprovalService, Depends(get_approvals)]
 HubDep = Annotated[EventHub, Depends(get_hub)]
-AuthDep = Annotated[None, Depends(require_auth)]
 RateLimitDep = Annotated[None, Depends(rate_limited)]
 
 
@@ -394,7 +393,6 @@ def websocket_auth(websocket: WebSocket, token: str | None = None) -> None:
 
 __all__ = [
     "ApprovalsDep",
-    "AuthDep",
     "EngineDep",
     "HubDep",
     "RateLimitDep",

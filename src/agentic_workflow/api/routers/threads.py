@@ -22,7 +22,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Path, Query, Response, status
 
-from agentic_workflow.api.deps import AuthDep, EngineDep
+from agentic_workflow.api.deps import EngineDep
 from agentic_workflow.api.routers.runs import project_detail
 from agentic_workflow.api.schemas import (
     CheckpointResponse,
@@ -49,7 +49,6 @@ ACCEPTED = status.HTTP_202_ACCEPTED
 async def thread_history(
     run_id: Annotated[str, Path(min_length=1, max_length=128)],
     engine: EngineDep,
-    _: AuthDep,
     limit: Annotated[int, Query(ge=1, le=1_000)] = 100,
 ) -> HistoryResponse:
     """Return a run's checkpoints, newest first.
@@ -57,7 +56,6 @@ async def thread_history(
     Args:
         run_id: The run to inspect.
         engine: The workflow engine.
-        _: Authentication dependency.
         limit: Maximum number of checkpoints to return.
 
     Returns:
@@ -94,7 +92,6 @@ async def checkpoint_state(
     run_id: Annotated[str, Path(min_length=1, max_length=128)],
     checkpoint_id: Annotated[str, Path(min_length=1, max_length=128)],
     engine: EngineDep,
-    _: AuthDep,
     response: Response,
 ) -> RunDetail:
     """Project a run as it was at a given checkpoint. Read-only.
@@ -106,7 +103,6 @@ async def checkpoint_state(
         run_id: The run to inspect.
         checkpoint_id: The checkpoint to read.
         engine: The workflow engine.
-        _: Authentication dependency.
         response: The outbound response, downgraded to ``202`` when the run was
             parked at that checkpoint.
 
@@ -136,7 +132,6 @@ async def replay_thread(
     run_id: Annotated[str, Path(min_length=1, max_length=128)],
     body: Annotated[ReplayRequest, Body()],
     engine: EngineDep,
-    _: AuthDep,
     response: Response,
 ) -> RunDetail:
     """Branch a run from a past checkpoint and drive the branch to a stopping point.
@@ -146,7 +141,6 @@ async def replay_thread(
         body: The checkpoint to branch from and an optional reason for the audit
             trail.
         engine: The workflow engine.
-        _: Authentication dependency.
         response: The outbound response, downgraded to ``202`` when the branch
             parks.
 
@@ -178,7 +172,6 @@ async def replay_thread(
 async def diff_checkpoints(
     run_id: Annotated[str, Path(min_length=1, max_length=128)],
     engine: EngineDep,
-    _: AuthDep,
     from_checkpoint: Annotated[str, Query(alias="from", min_length=1, max_length=128)],
     to_checkpoint: Annotated[str, Query(alias="to", min_length=1, max_length=128)],
 ) -> dict[str, Any]:
@@ -191,7 +184,6 @@ async def diff_checkpoints(
     Args:
         run_id: The run to inspect.
         engine: The workflow engine.
-        _: Authentication dependency.
         from_checkpoint: The earlier checkpoint.
         to_checkpoint: The later checkpoint.
 

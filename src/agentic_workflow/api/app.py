@@ -44,7 +44,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.types import ASGIApp
 
 from agentic_workflow import __version__
-from agentic_workflow.api.deps import RateLimiter, rate_limited
+from agentic_workflow.api.deps import RateLimiter, rate_limited, require_auth
 from agentic_workflow.api.error_handlers import install_error_handlers
 from agentic_workflow.api.events import EventHub
 from agentic_workflow.api.routers import approvals, events, health, runs, threads
@@ -235,13 +235,21 @@ def create_app(
     install_error_handlers(app)
 
     # `dependencies=` is applied at the router level rather than per handler so
-    # the throttle cannot be forgotten on a new endpoint. WebSockets are exempt:
-    # they authenticate in the handshake and have no HTTP request to throttle.
-    throttle = [Depends(rate_limited)]
+    # neither the throttle nor authentication can be forgotten on a new endpoint.
+    # Auth was per handler for its whole life, which left the twenty-one
+    # endpoints that carried it as the only thing between a new endpoint and an
+    # unauthenticated control plane; the two properties belong in the same
+    # place, and `tests/api/test_auth_surface.py` holds both to account.
+    #
+    # WebSockets are exempt from both: they authenticate in the handshake and
+    # have no HTTP request to throttle. The health probes, the root listing and
+    # `/metrics` are exempt from authentication only, and `docs/security.md`
+    # gives the reason for each.
+    secured = [Depends(rate_limited), Depends(require_auth)]
     app.include_router(health.router)
-    app.include_router(runs.router, dependencies=throttle)
-    app.include_router(approvals.router, dependencies=throttle)
-    app.include_router(threads.router, dependencies=throttle)
+    app.include_router(runs.router, dependencies=secured)
+    app.include_router(approvals.router, dependencies=secured)
+    app.include_router(threads.router, dependencies=secured)
     app.include_router(events.router)
     app.include_router(_meta_router())
 

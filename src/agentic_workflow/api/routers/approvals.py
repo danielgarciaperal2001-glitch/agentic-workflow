@@ -25,7 +25,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Path, Query, Response, status
 
-from agentic_workflow.api.deps import ApprovalsDep, AuthDep, EngineDep
+from agentic_workflow.api.deps import ApprovalsDep, EngineDep
 from agentic_workflow.api.schemas import (
     ApprovalListResponse,
     ResolutionResponse,
@@ -51,7 +51,6 @@ ACCEPTED = status.HTTP_202_ACCEPTED
 )
 async def list_approvals(
     approvals: ApprovalsDep,
-    _: AuthDep,
     run_id: Annotated[str | None, Query(description="Restrict the inbox to a single run.")] = None,
 ) -> ApprovalListResponse:
     """Return the approval inbox, oldest request first.
@@ -63,7 +62,6 @@ async def list_approvals(
 
     Args:
         approvals: The approval service.
-        _: Authentication dependency.
         run_id: Optional run filter.
 
     Returns:
@@ -77,12 +75,11 @@ async def list_approvals(
     "/stats",
     summary="Inbox counters for dashboards and probes",
 )
-async def approval_stats(approvals: ApprovalsDep, _: AuthDep) -> dict[str, Any]:
+async def approval_stats(approvals: ApprovalsDep) -> dict[str, Any]:
     """Return pending / expired / resolved counters, grouped by stage.
 
     Args:
         approvals: The approval service.
-        _: Authentication dependency.
 
     Returns:
         A mapping of counters.
@@ -98,14 +95,12 @@ async def approval_stats(approvals: ApprovalsDep, _: AuthDep) -> dict[str, Any]:
 async def get_approval(
     approval_id: Annotated[str, Path(min_length=1, max_length=128)],
     approvals: ApprovalsDep,
-    _: AuthDep,
 ) -> dict[str, Any]:
     """Return one approval enriched with its run context.
 
     Args:
         approval_id: The approval to fetch.
         approvals: The approval service.
-        _: Authentication dependency.
 
     Returns:
         The serialised approval view.
@@ -131,7 +126,6 @@ async def resolve_approval(
     approval_id: Annotated[str, Path(min_length=1, max_length=128)],
     body: Annotated[ResolveApprovalRequest, Body()],
     approvals: ApprovalsDep,
-    _: AuthDep,
     response: Response,
 ) -> ResolutionResponse:
     """Answer a gate and let the run continue.
@@ -140,7 +134,6 @@ async def resolve_approval(
         approval_id: The approval being answered.
         body: The verdict, the reviewer and any replacement content.
         approvals: The approval service.
-        _: Authentication dependency.
         response: The outbound response, downgraded to ``202`` when the run parks
             on the next gate.
 
@@ -178,7 +171,6 @@ async def replay_approval(
     approval_id: Annotated[str, Path(min_length=1, max_length=128)],
     body: Annotated[ResolveApprovalRequest, Body()],
     approvals: ApprovalsDep,
-    _: AuthDep,
 ) -> ResolutionResponse:
     """Re-submit a decision that was already applied, without re-running the graph.
 
@@ -192,7 +184,6 @@ async def replay_approval(
         approval_id: The approval being re-submitted.
         body: The decision the client believes it sent.
         approvals: The approval service.
-        _: Authentication dependency.
 
     Returns:
         A :class:`~agentic_workflow.api.schemas.ResolutionResponse` with
@@ -210,7 +201,7 @@ async def replay_approval(
     "/sweep",
     summary="Report approvals whose decision window has closed",
 )
-async def sweep_expired(approvals: ApprovalsDep, _: AuthDep) -> dict[str, Any]:
+async def sweep_expired(approvals: ApprovalsDep) -> dict[str, Any]:
     """Return the ids of approvals nobody answered in time.
 
     This does **not** cancel or auto-decline anything. Expiry is a signal for an
@@ -220,7 +211,6 @@ async def sweep_expired(approvals: ApprovalsDep, _: AuthDep) -> dict[str, Any]:
 
     Args:
         approvals: The approval service.
-        _: Authentication dependency.
 
     Returns:
         The expired approval ids and how long they have been waiting.
@@ -237,14 +227,12 @@ async def sweep_expired(approvals: ApprovalsDep, _: AuthDep) -> dict[str, Any]:
 async def approval_diff(
     approval_id: Annotated[str, Path(min_length=1, max_length=128)],
     approvals: ApprovalsDep,
-    _: AuthDep,
 ) -> dict[str, Any]:
     """Return the unified diff a reviewer is being asked to approve.
 
     Args:
         approval_id: The approval to inspect.
         approvals: The approval service.
-        _: Authentication dependency.
 
     Returns:
         The diff text and the files it touches.
@@ -278,7 +266,6 @@ async def audit_run(
     run_id: Annotated[str, Path(min_length=1, max_length=128)],
     approvals: ApprovalsDep,
     engine: EngineDep,
-    _: AuthDep,
     response: Response,
 ) -> dict[str, Any]:
     """Re-derive every decision signature for a run.
@@ -291,7 +278,6 @@ async def audit_run(
         run_id: The run to audit.
         approvals: The approval service.
         engine: The workflow engine, used to confirm the run exists.
-        _: Authentication dependency.
         response: The outbound response.
 
     Returns:

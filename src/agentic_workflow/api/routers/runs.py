@@ -22,7 +22,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Header, Path, Query, Response, status
 
-from agentic_workflow.api.deps import AuthDep, EngineDep
+from agentic_workflow.api.deps import EngineDep
 from agentic_workflow.api.schemas import (
     ResumeRunRequest,
     RunDetail,
@@ -99,7 +99,6 @@ def _outcome_status(outcome: RunOutcome) -> int:
 async def start_run(
     body: Annotated[StartRunRequest, Body()],
     engine: EngineDep,
-    _: AuthDep,
     response: Response,
     content_hash: Annotated[str | None, Header(alias="X-Content-Hash")] = None,
 ) -> RunDetail:
@@ -109,7 +108,6 @@ async def start_run(
         body: The run request. Set ``auto_resolve`` to answer every gate
             automatically and get a finished run in a single call.
         engine: The workflow engine.
-        _: Authentication dependency.
         __: Rate-limit dependency.
         response: The outbound response, whose status is downgraded to ``202``
             when the run parks.
@@ -164,7 +162,6 @@ async def start_run(
 @router.get("", response_model=RunListResponse, summary="List runs")
 async def list_runs(
     engine: EngineDep,
-    _: AuthDep,
     status_filter: Annotated[
         str | None,
         Query(alias="status", description="Filter by run status."),
@@ -176,7 +173,6 @@ async def list_runs(
 
     Args:
         engine: The workflow engine.
-        _: Authentication dependency.
         status_filter: Optional status filter.
         limit: Maximum number of runs to return.
         offset: Pagination offset.
@@ -199,7 +195,6 @@ async def list_runs(
 async def get_run(
     run_id: Annotated[str, Path(min_length=1, max_length=128)],
     engine: EngineDep,
-    _: AuthDep,
     response: Response,
 ) -> RunDetail:
     """Read the current state of a run from the checkpoint store.
@@ -207,7 +202,6 @@ async def get_run(
     Args:
         run_id: The run to inspect.
         engine: The workflow engine.
-        _: Authentication dependency.
         response: The outbound response, downgraded to ``202`` when parked.
 
     Returns:
@@ -232,7 +226,6 @@ async def get_run(
 async def get_report(
     run_id: Annotated[str, Path(min_length=1, max_length=128)],
     engine: EngineDep,
-    _: AuthDep,
     response: Response,
 ) -> Any:
     """Return the final report produced by a run.
@@ -240,7 +233,6 @@ async def get_report(
     Args:
         run_id: The run to inspect.
         engine: The workflow engine.
-        _: Authentication dependency.
         response: The outbound response.
 
     Returns:
@@ -270,7 +262,6 @@ async def resume_run(
     run_id: Annotated[str, Path(min_length=1, max_length=128)],
     body: Annotated[ResumeRunRequest, Body()],
     engine: EngineDep,
-    _: AuthDep,
     response: Response,
 ) -> RunDetail:
     """Answer the pending gate and let the run continue.
@@ -284,7 +275,6 @@ async def resume_run(
         run_id: The parked run.
         body: The human decision.
         engine: The workflow engine.
-        _: Authentication dependency.
         response: The outbound response, downgraded to ``202`` when parked again.
 
     Returns:
@@ -308,7 +298,6 @@ async def resume_run(
 async def cancel_run(
     run_id: Annotated[str, Path(min_length=1, max_length=128)],
     engine: EngineDep,
-    _: AuthDep,
     reason: Annotated[str, Query(max_length=500)] = "cancelled via API",
 ) -> RunDetail:
     """Cancel a run, keeping every completed checkpoint.
@@ -316,7 +305,6 @@ async def cancel_run(
     Args:
         run_id: The run to cancel.
         engine: The workflow engine.
-        _: Authentication dependency.
         reason: Recorded on the run for the audit trail.
 
     Returns:
@@ -338,14 +326,12 @@ async def cancel_run(
 async def list_decisions(
     run_id: Annotated[str, Path(min_length=1, max_length=128)],
     engine: EngineDep,
-    _: AuthDep,
 ) -> dict[str, Any]:
     """Return the append-only decision log of a run.
 
     Args:
         run_id: The run to inspect.
         engine: The workflow engine.
-        _: Authentication dependency.
 
     Returns:
         A mapping with the ordered decisions and a count.
@@ -365,14 +351,12 @@ async def list_decisions(
 async def list_timings(
     run_id: Annotated[str, Path(min_length=1, max_length=128)],
     engine: EngineDep,
-    _: AuthDep,
 ) -> dict[str, Any]:
     """Return per-node timings recorded during a run.
 
     Args:
         run_id: The run to inspect.
         engine: The workflow engine.
-        _: Authentication dependency.
 
     Returns:
         A mapping with the timings, their total and the slowest node.
@@ -401,7 +385,6 @@ async def list_timings(
 async def get_run_usage(
     run_id: Annotated[str, Path(min_length=1, max_length=128)],
     engine: EngineDep,
-    _: AuthDep,
 ) -> dict[str, Any]:
     """Return the LLM usage attributed to this run so far.
 
@@ -414,7 +397,6 @@ async def get_run_usage(
     Args:
         run_id: The run to inspect.
         engine: The workflow engine.
-        _: Authentication dependency.
 
     Returns:
         A mapping with the attributed usage counters.
