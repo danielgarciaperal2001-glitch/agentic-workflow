@@ -38,6 +38,10 @@ open http://localhost:8000/docs
 The image is multi-stage, runs as a non-root user, and has no build tooling in
 the runtime layer. `docker compose up` is the whole setup.
 
+That stack comes up with authentication **off**, which is the right default for
+a laptop and the wrong one for anything reachable from another machine. If this
+is a real deployment, read [`security.md`](security.md) before exposing it.
+
 ## Behind a reverse proxy
 
 If the API is not exposed directly, one setting decides whether the request
@@ -428,9 +432,16 @@ Everything is `AWF_`-prefixed. The ones worth knowing by heart:
 | `AWF_HITL_SIGNING_SECRET` | — | Key that signs decisions. Falls back to `AWF_API_AUTH_TOKEN`. |
 | `AWF_MAX_ITERATIONS` | `6` | Feedback-loop budget before the run is escalated. |
 | `AWF_STATE_RETENTION_DAYS` | `30` | Retention window for the janitor. |
+| `AWF_API_AUTH_ENABLED` | `false` | Require a bearer token on every `/v1` route and on the sockets. |
+| `AWF_API_AUTH_TOKEN` | — | The token. Required when authentication is on. |
 | `AWF_API_RATE_LIMIT_PER_MINUTE` | `120` | Per-client request budget. |
 | `AWF_API_TRUST_FORWARDED_FOR` | `false` | Key the limiter on `X-Forwarded-For`. Only behind a proxy that overwrites it. |
+| `AWF_API_CORS_ORIGINS` | `http://localhost:3000` | Browser origins allowed to call the API. |
 | `AWF_LOG_FORMAT` | `console` | `json` for machine-readable logs. |
+
+The two rows that decide whether the plane is a control plane or a public
+service are the first two. See [`security.md`](security.md) for the posture,
+and for what stays open on purpose.
 
 `Settings` **refuses** `awf_`-prefixed keyword arguments, so
 `Settings(AWF_LOG_LEVEL="DEBUG")` is a loud `ConfigurationError` rather than a

@@ -416,6 +416,8 @@ silently redirect every table in the application.
 - [`docs/hitl.md`](docs/hitl.md) — the gate lifecycle, the five escalation rules,
   and the failure modes.
 - [`docs/runbook.md`](docs/runbook.md) — operating it, and what to do when.
+- [`docs/security.md`](docs/security.md) — what the control plane can do, what
+  is protected, what is deliberately open, and how to deploy it.
 
 ## What this does not do
 

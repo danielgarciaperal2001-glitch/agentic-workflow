@@ -318,10 +318,15 @@ probes.
 
 Three decisions that are not obvious from the route list:
 
-**Health probes are unthrottled.** Rate limiting is applied per-router with
-`include_router(..., dependencies=throttle)` on runs, approvals and threads
-only. A liveness probe that can be rate-limited is a liveness probe that
-reports the process unhealthy because someone else is busy.
+**The secured routers are secured structurally.** Rate limiting *and*
+authentication are both applied with `include_router(..., dependencies=[...])`
+on runs, approvals and threads, and nowhere else. A liveness probe that can be
+rate-limited is a liveness probe that reports the process unhealthy because
+someone else is busy, and a probe that needs a token is a probe that fails the
+day the token rotates. The same `dependencies=` list means neither property can
+be forgotten on a new endpoint — see [`security.md`](security.md) for the routes
+that are open on purpose, and `tests/api/test_auth_surface.py` for the test that
+holds the two lists to account.
 
 **The event sink is transport, not lifecycle.** `create_app` *always* calls
 `active.set_event_sink(hub.publish)`, including for an engine the app did not
