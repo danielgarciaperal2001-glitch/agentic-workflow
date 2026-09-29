@@ -370,6 +370,11 @@ def websocket_auth(websocket: WebSocket, token: str | None = None) -> None:
     arrives as a query parameter. That is acceptable *only* because the socket is
     rejected during the handshake, before any workflow data flows.
 
+    The comparison is constant-time for the same reason :func:`require_auth` is:
+    a control plane whose only secret is a static token has no business leaking
+    its length or prefix, and the query string puts the refusal on a path an
+    attacker can call at leisure.
+
     Args:
         websocket: The inbound socket.
         token: Token supplied as ``?token=``.
@@ -382,7 +387,7 @@ def websocket_auth(websocket: WebSocket, token: str | None = None) -> None:
     if not settings.api_auth_enabled:
         return
     expected = settings.api_auth_token
-    if expected is None or not token or token != expected.get_secret_value():
+    if expected is None or not token or not hmac.compare_digest(token, expected.get_secret_value()):
         log.warning("ws.auth_failed", path=websocket.url.path)
         raise WebSocketDisconnect(code=status.WS_1008_POLICY_VIOLATION, reason="unauthorised")
 

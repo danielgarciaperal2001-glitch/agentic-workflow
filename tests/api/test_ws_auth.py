@@ -47,6 +47,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+import hmac
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -209,3 +210,53 @@ class TestSocketRefusal:
         """
         with _served() as client, client.websocket_connect("/ws/runs/ws-open-1") as socket:
             assert socket.receive_json()["event"] == "stream.open"
+
+
+@pytest.mark.timeout(REFUSAL_TIMEOUT)
+class TestSocketTokenComparison:
+    """The one secret is protected the same way on both transports."""
+
+    def test_the_comparison_does_not_leak_through_timing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The token is matched with the constant-time primitive, on the socket too.
+
+        Over HTTP it always was. On the socket it was a plain ``!=``, and Python's
+        string equality returns at the first differing byte: a caller who can time
+        the refusal gets a prefix oracle for the only secret the deployment holds.
+        Same secret, same threat, two different standards depending on which
+        endpoint the caller chose.
+
+        What makes a comparison constant-time is which function performs it, and
+        that is what is asserted — a spy on :func:`hmac.compare_digest` records
+        whether the socket path went through it. Timing a microsecond-scale
+        comparison is the alternative and it cannot be done reliably: it fails on
+        a loaded CI runner and passes on a hijacked implementation. The primitive
+        is pinned rather than the clock.
+        """
+        seen: list[tuple[str, str]] = []
+        real = hmac.compare_digest
+
+        def spy(left: Any, right: Any) -> bool:
+            seen.append((left, right))
+            return real(left, right)
+
+        monkeypatch.setattr(hmac, "compare_digest", spy)
+
+        with _served(api_auth_enabled=True, api_auth_token=TOKEN) as client:
+            _refused(client, "/ws/runs/ws-timing?token=guess")
+
+        assert seen, "the socket path compared the token without hmac.compare_digest"
+        assert ("guess", TOKEN) in seen or (TOKEN, "guess") in seen
+
+    def test_a_prefix_is_refused_even_though_it_starts_the_token(self) -> None:
+        """The dangerous shape is the near miss, so it is the one worth naming.
+
+        A whole-token match rejects both a truncated token and an extended one.
+        Asserting both ends closes off a "convenience" for a browser that lost its
+        last character, which would be a match on a prefix and would hand the
+        token over one character at a time.
+        """
+        with _served(api_auth_enabled=True, api_auth_token=TOKEN) as client:
+            for candidate in (TOKEN[:-1], TOKEN[1:], TOKEN + "x", TOKEN.upper()):
+                _refused(client, f"/ws/runs/ws-prefix?token={candidate}")
