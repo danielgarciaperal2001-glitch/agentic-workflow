@@ -108,7 +108,6 @@ async def start_run(
         body: The run request. Set ``auto_resolve`` to answer every gate
             automatically and get a finished run in a single call.
         engine: The workflow engine.
-        __: Rate-limit dependency.
         response: The outbound response, whose status is downgraded to ``202``
             when the run parks.
         content_hash: Optional idempotency key. When it matches the hash of a
