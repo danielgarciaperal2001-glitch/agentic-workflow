@@ -64,6 +64,8 @@ def project_detail(outcome: RunOutcome) -> RunDetail:
         error=outcome.error,
         is_parked=outcome.is_parked,
         is_finished=outcome.is_finished,
+        request_id=outcome.request_id,
+        metadata=outcome.metadata,
         usage=outcome.usage.as_dict(),
     )
 

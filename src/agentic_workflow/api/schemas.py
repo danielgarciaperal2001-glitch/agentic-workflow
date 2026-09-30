@@ -16,9 +16,11 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 
 from agentic_workflow.domain.schemas import (
+    MAX_METADATA_BYTES,
+    MAX_METADATA_KEYS,
     ApprovalDecision,
     ApprovalRequest,
     Decision,
@@ -27,6 +29,7 @@ from agentic_workflow.domain.schemas import (
     ReviewRequest,
     RunSummary,
     SourceFile,
+    reject_oversized_metadata,
 )
 
 #: Identifiers are interpolated into checkpoint thread keys and log fields, so the
@@ -45,6 +48,26 @@ class APIModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
+#: The wire alias for a bounded correlation dict.
+#:
+#: Defined in the domain module so the two models cannot drift: the request body
+#: is validated before the domain projection ever runs, so a bound that existed
+#: only on the domain model would be enforced *after* the oversized payload had
+#: already been parsed — which is precisely the work the bound exists to avoid.
+BoundedMetadata = Annotated[
+    dict[str, Any],
+    Field(
+        max_length=MAX_METADATA_KEYS,
+        description=(
+            "Free-form correlation data — a ticket id, a tenant, a branch. Echoed "
+            f"back verbatim on every read of the run, so bounded: at most "
+            f"{MAX_METADATA_KEYS} keys and {MAX_METADATA_BYTES} bytes serialised."
+        ),
+    ),
+    AfterValidator(reject_oversized_metadata),
+]
+
+
 # --------------------------------------------------------------------------- #
 # Requests
 # --------------------------------------------------------------------------- #
@@ -60,7 +83,8 @@ class StartRunRequest(APIModel):
         files: Source files to review.
         acceptance_criteria: Conditions the report must satisfy.
         constraints: Hard limits the agents must respect.
-        metadata: Correlation data propagated end-to-end.
+        metadata: Correlation data, echoed back on every read of the run. Bounded
+            the same way the domain model bounds it, and for the same reason.
         auto_resolve: Answer human gates automatically instead of parking.
         auto_decision: The verdict used when ``auto_resolve`` is set.
         max_gates: Safety bound on auto-resolved gates.
@@ -74,7 +98,10 @@ class StartRunRequest(APIModel):
     files: list[SourceFile] = Field(default_factory=list, max_length=200)
     acceptance_criteria: list[str] = Field(default_factory=list, max_length=50)
     constraints: list[str] = Field(default_factory=list, max_length=50)
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    # The default matters: `Annotated[..., Field(max_length=...)]` collapses to a
+    # required field when it is the *whole* annotation, because the Field carries
+    # no default. The bound is what this line is for, not the default.
+    metadata: BoundedMetadata = Field(default_factory=dict)
     auto_resolve: bool = Field(
         default=False,
         description="Answer every human gate automatically and run to completion.",
@@ -190,6 +217,24 @@ class RunDetail(APIModel):
     error: str | None = None
     is_parked: bool = False
     is_finished: bool = False
+    request_id: str | None = Field(
+        default=None,
+        description=(
+            "The submitter's own identifier for the work — a PR number, an "
+            "invoice id — echoed back from the checkpointed request. Distinct "
+            "from the ``X-Request-ID`` header, which identifies the HTTP call "
+            "and is returned on the response only."
+        ),
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "The submitter's correlation dict, echoed back verbatim from the "
+            "checkpointed request. Empty when none was submitted. Read from the "
+            "checkpointer rather than the run registry, so it answers the same "
+            "on every replica and survives a restart."
+        ),
+    )
     usage: dict[str, float | int] = Field(
         default_factory=dict,
         description=(

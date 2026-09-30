@@ -174,6 +174,15 @@ Then, in order:
    client re-fetches over REST. If this fires constantly, the reader is the
    problem — usually a client subscribed to `/ws/events` from every one of a
    fleet of tabs, where a single wildcard socket would do.
+6. **A run cannot be tied to the ticket that filed it** — two ids are in play
+   and they are not interchangeable. The log plane joins `X-Request-ID` to
+   `run_id`, so every line of a run carries both and one index query reconstructs
+   it; search for the *gateway's* value, not the PR number. The body
+   `request_id` and `metadata` are the submitter's own, returned on every read of
+   the run under the same names, read from the checkpoint so they survive a
+   restart and answer on any replica. If a run you started has neither in the log
+   nor on `GET /v1/runs/{id}`, check that the caller actually sent them: an empty
+   `metadata` is stored and returned as `{}`, it is never inferred.
 
 ### Postgres-backed runs cannot be read
 

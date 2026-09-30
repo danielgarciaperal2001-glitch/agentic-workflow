@@ -169,6 +169,11 @@ class RunOutcome:
             Exactly the completions the drive caused, per call, so concurrent
             runs never blur into each other. :meth:`~WorkflowEngine.run_until_done`
             reports the whole run; the registry accumulates it across drives.
+        request_id: The submitter's own identifier for the work (a PR number, an
+            invoice id), echoed back so a client can find the run it filed. Not
+            the ``X-Request-ID`` header, which identifies the HTTP call and lives
+            only in the log envelope.
+        metadata: The submitter's correlation dict, echoed back verbatim.
     """
 
     run_id: str
@@ -182,6 +187,12 @@ class RunOutcome:
     checkpoint_id: str | None = None
     next_nodes: tuple[str, ...] = ()
     usage: Usage = field(default_factory=Usage)
+    # Read from the checkpointed request, never from the registry: the registry
+    # is per-process, so it answers on the replica that served the POST and goes
+    # blank everywhere else. Its dict is also the engine's own annotation bag,
+    # so projecting it raw would hand the client keys it never sent.
+    request_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_parked(self) -> bool:
@@ -1601,6 +1612,10 @@ class WorkflowEngine:
             pending = None
             values = {**values, "status": record.status}
 
+        # The submitter's own correlation data, already checkpointed as part of
+        # the immutable request, so this costs a read and nothing else.
+        submitted = as_model(values, "request", ReviewRequest)
+
         return RunOutcome(
             run_id=run_id,
             status=status,
@@ -1612,6 +1627,8 @@ class WorkflowEngine:
             error=values.get("error") or (record.error if record is not None else None),
             checkpoint_id=_checkpoint_id(snap),
             next_nodes=tuple(snap.next or ()),
+            request_id=submitted.request_id if submitted is not None else None,
+            metadata=dict(submitted.metadata) if submitted is not None else {},
         )
 
     async def _read_checkpoint(self, run_id: str, checkpoint_id: str) -> Any:

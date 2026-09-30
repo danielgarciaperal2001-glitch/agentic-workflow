@@ -17,10 +17,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 import hashlib
+import json
 import re
 from typing import Annotated, Any, Self
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -29,6 +31,43 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+#: Bounds on :attr:`ReviewRequest.metadata`, the submitter's correlation dict.
+#:
+#: Unlike every other free field on the request, this one is echoed back on
+#: every read of the run, so its size is a property of the *read* path and not
+#: only of the write. Generous for what correlation data is — a ticket id, a
+#: tenant, a branch, an attempt counter — and far below the request's own
+#: content ceiling, so nothing legitimate is turned away.
+MAX_METADATA_KEYS = 64
+MAX_METADATA_BYTES = 4_096
+
+
+def reject_oversized_metadata(value: dict[str, Any]) -> dict[str, Any]:
+    """Reject a correlation dict too large to echo back on every read.
+
+    Key count alone is not a bound: ``{"k": "x" * 10_000}`` is one key and ten
+    kilobytes. This dict is stored in the checkpoint and returned on every read
+    of the run, so an unbounded one turns a metadata field into a way to make
+    ``GET /v1/runs/{id}`` answer with megabytes — measured at 19.5 MiB accepted
+    and returned before the check existed.
+
+    Args:
+        value: The candidate correlation dict.
+
+    Returns:
+        The dict unchanged.
+
+    Raises:
+        ValueError: If it serialises to more than :data:`MAX_METADATA_BYTES`.
+    """
+    encoded = json.dumps(value, default=str)
+    if len(encoded) > MAX_METADATA_BYTES:
+        raise ValueError(
+            f"metadata is {len(encoded)} bytes serialised, over the {MAX_METADATA_BYTES}-byte limit"
+        )
+    return value
+
 
 # --------------------------------------------------------------------------- #
 # Shared primitives
@@ -195,7 +234,16 @@ class ReviewRequest(StrictModel):
     files: list[SourceFile] = Field(default_factory=list, max_length=200)
     acceptance_criteria: list[str] = Field(default_factory=list, max_length=50)
     constraints: list[str] = Field(default_factory=list, max_length=50)
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: Annotated[dict[str, Any], AfterValidator(reject_oversized_metadata)] = Field(
+        default_factory=dict,
+        max_length=MAX_METADATA_KEYS,
+        description=(
+            "Free-form correlation data — a ticket id, a tenant, a branch. "
+            "Echoed back verbatim on every read of the run, so it is bounded: "
+            f"at most {MAX_METADATA_KEYS} keys and {MAX_METADATA_BYTES} bytes "
+            "serialised."
+        ),
+    )
 
     @field_validator("run_id", "request_id")
     @classmethod

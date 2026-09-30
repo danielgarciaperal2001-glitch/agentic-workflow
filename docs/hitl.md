@@ -202,6 +202,43 @@ It rides the `heartbeat` event name, so a client that ignores the field keeps
 working unchanged, and it arrives as soon as the loss happens rather than on the
 next idle tick — a client that fell behind is the one that never goes idle.
 
+## Correlating a run with the work that caused it
+
+`request_id` and `metadata` are the submitter's own fields, and they come back on
+every read of the run under the same names they were sent:
+
+```bash
+curl -s -X POST localhost:8000/v1/runs -H 'content-type: application/json' -d '{
+  "run_id": "pr-1042", "request_id": "PR-1042",
+  "title": "Fix rounding in invoice totals",
+  "files": [{"path": "checkout/total.py", "content": "..."}],
+  "metadata": {"repo": "acme/checkout", "branch": "fix/rounding"}
+}'
+```
+
+```json
+{"run_id": "pr-1042", "request_id": "PR-1042", "status": "waiting_human",
+ "metadata": {"repo": "acme/checkout", "branch": "fix/rounding"}}
+```
+
+They are read back from the checkpointed request, not from the run registry, so
+they answer the same on every replica and survive a restart. The registry is
+per-process and rebuilt at startup, and its own dict is the engine's annotation
+bag — projecting that would hand the client keys it never sent.
+
+`metadata` is bounded: at most 64 keys and 4096 bytes serialised, refused with
+**422** past that. The bound exists because the dict is now returned on every
+read — measured before it, a 19.5 MiB `metadata` was accepted and came back on
+the following `GET`.
+
+**Two ids, both called `request_id`.** The body field is the submitter's: a PR
+number, a ticket, an invoice id, stored with the run and returned with it. The
+`X-Request-ID` header identifies the *HTTP call* instead — it is echoed on the
+response and appears on the run's log lines, but is not stored with the run. The
+log plane joins `X-Request-ID` to `run_id` for the whole run; the API joins the
+body `request_id` to the run for as long as the checkpoint lives. Neither
+substitutes for the other.
+
 ## The audit log
 
 Every decision is appended, never updated:
