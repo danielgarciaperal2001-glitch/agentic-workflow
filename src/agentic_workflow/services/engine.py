@@ -715,6 +715,13 @@ class WorkflowEngine:
         registry, so a process restart — or a read served by a different replica
         after a load balancer moved the request — returns the same answer.
 
+        One field is the exception, and deliberately so. ``usage`` is this
+        process's attribution of its own model calls rather than run state, so it
+        is projected from the registry: authoritative status with an honest,
+        non-durable token count. The alternative was worse, not different — the
+        field is on every payload this returns, and an all-zero ``usage`` on a run
+        that demonstrably spent tokens reads as "this deployment is free".
+
         Args:
             run_id: The run to inspect.
 
@@ -1685,6 +1692,13 @@ class WorkflowEngine:
             decisions=[dict(entry) for entry in (values.get("human_decisions") or [])],
             timings=as_models(values, "node_timings", NodeTiming),
             error=values.get("error") or (record.error if record is not None else None),
+            # Token spend is the other thing the graph cannot report about itself:
+            # no node writes it to the checkpoint, because it is this process's
+            # attribution of its own model calls and not run state. Without this
+            # projection the outcome a *read* produces carries zeros, so every
+            # read of a finished run reports a run that spent nothing while the
+            # operation that drove it reported the real total.
+            usage=record.usage if record is not None else Usage(),
             checkpoint_id=_checkpoint_id(snap),
             next_nodes=tuple(snap.next or ()),
             request_id=submitted.request_id if submitted is not None else None,

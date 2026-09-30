@@ -723,15 +723,14 @@ def test_json_output_is_the_servers_payload_verbatim(
 
     Reformatting the server's answer would mean the CLI had to be updated every
     time a field is added, and would leave ``--json`` disagreeing with
-    ``GET /v1/runs/{id}``. So the assertion is that the printed document and the
-    document the server hands to any other client carry the *same fields* —
-    nothing renamed, nothing dropped, nothing invented — which is the property
-    that lets a pipeline treat the two as one answer.
+    ``GET /v1/runs/{id}``. So the assertion is that the two are the *same
+    document* — every field, every value — which is the property that lets a
+    pipeline treat them as one answer rather than two that ought to match.
 
-    The values are deliberately not compared field by field. That is the
-    server's contract to keep, not the CLI's to assert: this test is about
-    whether the bytes were forwarded untouched, and a test that also pinned
-    every value would fail for reasons that have nothing to do with forwarding.
+    This compares values, not just field names, and that is only fair now that
+    both sides project the same accumulated usage. A ``GET`` reporting zero
+    tokens for a run the submission just paid for would fail here, and would be
+    right to.
     """
     import argparse
     import asyncio
@@ -774,8 +773,7 @@ def test_json_output_is_the_servers_payload_verbatim(
     code, printed, fetched = asyncio.run(drive())
 
     assert code == 0
-    assert set(printed) == set(fetched), "--json must carry the server's own fields"
-    assert printed["run_id"] == "json-please", "the id has to come back to fetch or watch it"
+    assert printed == fetched, "--json and GET must be the same document"
     assert printed["usage"]["total_tokens"] > 0, "a completed run reports what it spent"
     assert printed["is_finished"] is True
 

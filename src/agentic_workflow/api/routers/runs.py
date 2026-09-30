@@ -406,9 +406,12 @@ async def get_run_usage(
 
     The totals accumulate on the registry across every drive the engine has
     performed for the run — the parked start, each resolve — so this answers
-    "what has it cost" without counting model calls in log lines. Unlike a
-    checkpoint read, the attribution is process memory: after a restart it
+    "what has it cost" without counting model calls in log lines. Unlike the rest
+    of a run's state, the attribution is process memory: after a restart it
     begins empty again even though the run's state survives.
+
+    ``RunDetail.usage`` carries the same number, so the two never disagree; this
+    route exists for a client that wants the spend without the rest of the run.
 
     Args:
         run_id: The run to inspect.
