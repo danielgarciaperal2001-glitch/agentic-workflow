@@ -111,7 +111,15 @@ async def ready(request: Request, response: Response) -> HealthResponse:
         }
         if settings.use_durable_checkpointer:
             try:
-                await asyncio.wait_for(_check_store(engine), timeout=PROBE_TIMEOUT_SECONDS)
+                # `asyncio.timeout` rather than `asyncio.wait_for`: on 3.11
+                # `wait_for` returns the inner result and discards a cancellation
+                # that arrived in the same moment, so a client that hangs up
+                # mid-probe leaves the request running to completion. Both probes
+                # here can complete instantly, which is exactly when that branch is
+                # taken. The `except TimeoutError` below is already the only thing
+                # catching, so the cancellation propagates on its own.
+                async with asyncio.timeout(PROBE_TIMEOUT_SECONDS):
+                    await _check_store(engine)
             except TimeoutError:
                 checks["checkpointer"] = {"ok": False, "detail": "read timed out after 5s"}
                 healthy = False
@@ -131,9 +139,8 @@ async def ready(request: Request, response: Response) -> HealthResponse:
     approvals = getattr(request.app.state, "approvals", None)
     if approvals is not None:
         try:
-            checks["approvals"] = await asyncio.wait_for(
-                approvals.probe_stats(), timeout=PROBE_TIMEOUT_SECONDS
-            )
+            async with asyncio.timeout(PROBE_TIMEOUT_SECONDS):
+                checks["approvals"] = await approvals.probe_stats()
         except Exception as exc:
             checks["approvals"] = {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
             healthy = False

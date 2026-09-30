@@ -274,7 +274,12 @@ async def _send(websocket: WebSocket, payload: dict[str, Any], timeout: float) -
     """
     frame = json.dumps(payload, default=str)
     try:
-        await asyncio.wait_for(websocket.send_text(frame), timeout=timeout)
+        # `asyncio.timeout`, not `asyncio.wait_for`, for the reason spelled out on
+        # `Subscription.get`: on 3.11 `wait_for` returns the inner result and drops
+        # a cancellation that arrived in the same moment, which here is the
+        # cancellation that ends the pump.
+        async with asyncio.timeout(timeout):
+            await websocket.send_text(frame)
     except TimeoutError as exc:
         # A client that accepts the TCP connection but never reads is worse than
         # one that disconnects: the send would block forever and leak a coroutine

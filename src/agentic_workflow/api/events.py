@@ -161,6 +161,27 @@ class Subscription:
     async def get(self, *, timeout: float) -> dict[str, Any] | None:
         """Await the next event.
 
+        Uses :func:`asyncio.timeout` rather than :func:`asyncio.wait_for`, and the
+        distinction is load-bearing on Python 3.11. There, ``wait_for`` wraps its
+        argument in a task and, on cancellation, does this::
+
+            except CancelledError:
+                if fut.done():
+                    return fut.result()   # the cancellation is discarded
+                else:
+                    ...
+                    raise
+
+        This method is the reason a subscription's queue is worth filling: a full
+        queue is what a *lagging* reader has, and a full queue makes ``Queue.get()``
+        return without suspending, so ``fut`` is always already done and the
+        cancellation that ends the pump is the one ``wait_for`` throws away. The
+        reader then loops forever on a queue nobody is draining, and while the queue
+        stays full its loop has no suspension point left, so it starves the event
+        loop rather than merely leaking its own slot. ``asyncio.timeout`` has no
+        wrapped future to inspect and re-raises an external ``CancelledError``
+        untouched; catching ``TimeoutError`` alone is what already lets it through.
+
         Args:
             timeout: Seconds to wait before giving up.
 
@@ -169,7 +190,8 @@ class Subscription:
             turns into a heartbeat frame rather than a disconnect.
         """
         try:
-            return await asyncio.wait_for(self.queue.get(), timeout=timeout)
+            async with asyncio.timeout(timeout):
+                return await self.queue.get()
         except TimeoutError:
             return None
 
