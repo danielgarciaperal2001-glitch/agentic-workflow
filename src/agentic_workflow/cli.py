@@ -41,6 +41,14 @@ from agentic_workflow import __version__
 NOT_DONE = 1
 #: Exit code used for bad input.
 BAD_INPUT = 2
+#: Exit code used when the server refused the request because a budget was
+#: exhausted — the per-client request budget, the concurrency budget, or a run's
+#: own token budget. Distinct from :data:`NOT_DONE` because the run never
+#: started: nothing is pending and nothing is progressing, so a script that
+#: treats ``NOT_DONE`` as "waiting, check again later" would wait forever for a
+#: run that does not exist. The remedy differs too — wait, versus submit less or
+#: raise the ceiling.
+THROTTLED = 3
 
 #: The defect the ``demo`` command reviews. Chosen because it is small enough to
 #: read on a terminal, obviously wrong to a reviewer, and has an exact answer:
@@ -405,6 +413,449 @@ async def _cmd_watch(args: argparse.Namespace) -> int:
         The process exit code.
     """
     return await _watch(args.url, args.run_id, token=args.token, max_frames=args.max_frames)
+
+
+# --------------------------------------------------------------------------- #
+# Submitting
+# --------------------------------------------------------------------------- #
+def _content_hash(files: list[dict[str, str]], description: str) -> str:
+    """Compute the server's ``X-Content-Hash`` for a submission.
+
+    A byte-for-byte restatement of :attr:`ReviewRequest.content_hash`, and that
+    duplication is the point: the CLI cannot import the domain model and ask it,
+    because the whole point of this command is that the engine lives in another
+    process. So the formula is restated here, and
+    ``test_the_client_hash_matches_the_domains_own`` asserts the two agree. A
+    hash computed any other way would not be "a slightly different key", it
+    would be a *different* key, and the server would answer a mismatch with
+    ``400`` — a failure that reads like the tool is broken.
+
+    Args:
+        files: The submitted files, each with ``path`` and ``content``, in the
+            order they will be sent. Order matters: the digest is a stream.
+        description: The run's description.
+
+    Returns:
+        The header value, ``sha256:`` plus 32 hex characters.
+    """
+    import hashlib
+
+    hasher = hashlib.sha256()
+    for entry in files:
+        hasher.update(entry["path"].encode())
+        hasher.update(b"\0")
+        hasher.update(entry["content"].encode())
+        hasher.update(b"\0")
+    hasher.update(description.encode())
+    return f"sha256:{hasher.hexdigest()[:32]}"
+
+
+def _run_id_for(title: str) -> str:
+    """Derive a wire-legal run id from *title*.
+
+    ``run_id`` is required on the wire and is also the handle ``awf watch``
+    takes, so a default that a user cannot predict would make the run
+    unfollowable without first reading the output. The title is the one thing
+    the user always supplied, so it is the natural id.
+
+    The wire constrains ids to ``^[A-Za-z0-9._:-]+$``, which a perfectly
+    ordinary title can violate — ``Fix: checkout/total`` is a normal thing to
+    type. Only the characters the pattern forbids are replaced; case is kept,
+    because folding ``Fix the total`` to ``fix-the-total`` would be a
+    transformation the user never asked for and could not predict, and a run id
+    is meant to be guessable from the title they typed. Runs of dashes collapse
+    and the result is truncated to the 128-character limit. A title that
+    sanitises to nothing (``"///"``, whitespace) falls back to ``run`` rather
+    than sending an empty id, which the server would reject as a validation
+    error with no explanation.
+
+    Args:
+        title: The run's title.
+
+    Returns:
+        A non-empty id matching the wire's pattern.
+    """
+    import re
+
+    slug = re.sub(r"[^A-Za-z0-9._:-]+", "-", title.strip()).strip("-.")
+    slug = re.sub(r"-{2,}", "-", slug)[:128].strip("-")
+    return slug or "run"
+
+
+def _wire_path(raw: str) -> str:
+    """Turn a path the user typed into one the API will accept.
+
+    ``SourceFile.path`` rejects anything absolute and anything containing ``..``,
+    because the name is fed to the agents as repository-relative context. That is
+    a good rule for a client assembling a body by hand and a bad surprise for a
+    command line, where ``--file /home/me/project/src/checkout.py`` and
+    ``--file ../shared/util.py`` are the most natural things to type. Rejecting
+    them would make the command fail on ordinary use with a validation error
+    about a field the user never named.
+
+    So the path is made relative to the working directory, which is the
+    repository root as far as a command line is concerned. A file outside it
+    cannot be expressed relatively without a ``..`` the API forbids, so it is
+    sent by name alone: the name is a label the agents read, and the content —
+    which is what actually gets reviewed — is unaffected.
+
+    Args:
+        raw: The path as typed.
+
+    Returns:
+        A relative path with no ``..``, falling back to the file's name.
+    """
+    path = Path(raw)
+    posix = path.as_posix()
+    if not posix.startswith("/") and ".." not in posix.split("/"):
+        return posix
+    try:
+        return path.resolve().relative_to(Path.cwd()).as_posix()
+    except ValueError:
+        return path.name
+
+
+def _read_files(paths: list[str]) -> list[dict[str, str]]:
+    """Read the submitted files, or report the first one that cannot be read.
+
+    Reading happens before the request is built, and therefore before anything
+    is sent. A submission whose body cannot be assembled should not cost a
+    request, and the message has to carry the offending path: "no such file"
+    without it is a wild goose chase through a ``--file`` list.
+
+    Args:
+        paths: Paths to read, in the order the user gave them.
+
+    Returns:
+        One ``{"path", "content"}`` mapping per file, with the path rewritten
+        by :func:`_wire_path` so the API accepts it.
+
+    Raises:
+        OSError: If a path cannot be read. The message names the path.
+    """
+    files: list[dict[str, str]] = []
+    for raw in paths:
+        path = Path(raw)
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise OSError(f"cannot read {raw}: {exc.strerror or exc}") from exc
+        files.append({"path": _wire_path(raw), "content": content})
+    return files
+
+
+def _read_metadata(pairs: list[str]) -> dict[str, str]:
+    """Parse repeated ``key=value`` metadata arguments.
+
+    A malformed pair is a typo the user can see and fix, so it is rejected here
+    rather than forwarded. Forwarding it would produce a server-side validation
+    error whose message describes the field, not the ``--metadata`` argument
+    that was actually typed — the same "silent until it fails" shape as any
+    other argument mistake.
+
+    Args:
+        pairs: The raw ``key=value`` strings.
+
+    Returns:
+        The metadata mapping.
+
+    Raises:
+        ValueError: If a pair has no ``=`` or an empty key.
+    """
+    metadata: dict[str, str] = {}
+    for pair in pairs:
+        key, separator, value = pair.partition("=")
+        if not separator or not key:
+            raise ValueError(f"--metadata expects key=value, got {pair!r}")
+        metadata[key] = value
+    return metadata
+
+
+def _error_of(payload: Any, status: int) -> tuple[str, str, dict[str, Any]]:
+    """Pull ``(code, message, context)`` out of an error envelope.
+
+    The server answers errors with a stable envelope, so the CLI reads that
+    rather than pattern-matching on prose. When the body is not an envelope — a
+    proxy's HTML error page, say — the status is reported instead of a
+    ``KeyError`` escaping out of a formatter.
+
+    Args:
+        payload: The decoded response body.
+        status: The HTTP status, used when the body is not an envelope.
+
+    Returns:
+        The error code, its message, and any context the server attached.
+    """
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        error = payload["error"]
+        context = error.get("context")
+        return (
+            str(error.get("code") or f"http_{status}"),
+            str(error.get("message") or f"HTTP {status}"),
+            context if isinstance(context, dict) else {},
+        )
+    return f"http_{status}", f"HTTP {status}", {}
+
+
+class SubmissionError(OSError):
+    """A submission that never produced an HTTP response.
+
+    Two things can go wrong that are not answers from the server: the connection
+    never opened, or it opened and then went quiet. They need different advice,
+    so this carries a message already written for the case rather than making the
+    caller re-derive one from an exception class.
+
+    Deriving it as an :class:`OSError` is also what keeps ``httpx`` from leaking
+    out of this module. ``httpx`` is imported inside the functions that use it so
+    that a plain ``awf demo`` on a machine without the ``api`` extra still works,
+    and the natural place for that isolation to leak is a caller writing
+    ``except httpx.HTTPError`` — which would then be an ``ImportError`` on
+    exactly the installations the lazy import exists to protect.
+
+    Note what is *not* here: ``httpx``'s own exceptions do not inherit from
+    ``OSError``, so a bare ``except OSError`` around the request catches none of
+    them. An unreachable server therefore arrives as an unhandled
+    ``ConnectError`` — a traceback-free one-line message and exit code 1, which
+    reads as "the run did not finish" rather than "nothing was listening".
+    """
+
+
+async def _submit(
+    base_url: str,
+    body: dict[str, Any],
+    *,
+    content_hash: str,
+    token: str | None = None,
+    timeout: float = 900.0,
+) -> tuple[int, Any]:
+    """POST a run body to a server and return its status and decoded body.
+
+    The token travels as an ``Authorization`` header, not in the URL. ``watch``
+    cannot do that — a WebSocket handshake from a browser carries no
+    ``Authorization`` header, which is why its token rides in the query string
+    and why its error messages strip the query string before printing. HTTP has
+    no such constraint, and a credential in a URL is written down by every
+    proxy and load balancer on the path.
+
+    Args:
+        base_url: The server's HTTP origin.
+        body: The wire body.
+        content_hash: The ``X-Content-Hash`` idempotency key.
+        token: Bearer token for a server with ``api_auth_enabled``.
+        timeout: Seconds to wait for the response. Generous by default because
+            a synchronous ``POST /v1/runs`` drives the whole graph — up to
+            ``run_timeout_seconds`` — and a client deadline shorter than the
+            server's own would abandon a run that is still working.
+
+    Returns:
+        The HTTP status and the decoded body.
+
+    Raises:
+        SubmissionError: If the server could not be reached, or the response
+            never arrived. A timeout says so explicitly, because the run may
+            still be going and re-submitting it would duplicate the work.
+    """
+    import httpx
+
+    headers = {"X-Content-Hash": content_hash}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{base_url.rstrip('/')}/v1/runs", json=body, headers=headers
+            )
+    except httpx.TimeoutException as exc:
+        # The run may well exist: the request reached the server, and the server
+        # is still driving the graph. Saying so is the difference between an
+        # operator watching the run and an operator submitting it again.
+        raise SubmissionError(
+            f"no response from {base_url} within {timeout:g}s. The run may still "
+            f"be running on the server — look for it with "
+            f"GET /v1/runs/{body.get('run_id', '?')} rather than submitting again"
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise SubmissionError(f"cannot reach {base_url}: {exc}") from exc
+
+    try:
+        return response.status_code, response.json()
+    except ValueError:
+        return response.status_code, None
+
+
+def _report_refusal(code: str, message: str, context: dict[str, Any]) -> int:
+    """Print one refusal the way a user can act on it, and pick an exit code.
+
+    The refusals a submission can hit mean different things, so they are told
+    apart rather than collapsed into "request failed":
+
+    * a **budget** refusal is not transient, so the message says so and says
+      which budget. Retrying the same payload reaches the same answer;
+    * a **401** is a missing or wrong token, so it names the env var that
+      supplies it. A bare status code teaches nothing about the fix;
+    * a **409** on a run id is usually a real duplicate, so it names the two
+      ways out: the content hash turns a genuine resubmission into a replay, and
+      ``--run-id`` starts a different thread.
+
+    Args:
+        code: The error code from the envelope.
+        message: Its message.
+        context: Whatever context the server attached.
+
+    Returns:
+        The process exit code.
+    """
+    if code == "token_budget_exceeded":
+        budget = context.get("budget")
+        spent = context.get("spent")
+        detail = f" (budget {budget}, spent {spent})" if budget is not None else ""
+        _echo(
+            f"refused: this run reached its token budget{detail}, which is more "
+            f"than one submission should be allowed to cost. Submit fewer or "
+            f"smaller files, or raise llm_token_budget_per_run. Retrying the same "
+            f"payload spends the same tokens to reach the same answer.",
+            file=sys.stderr,
+        )
+        return THROTTLED
+
+    if code in {"rate_limited", "concurrency_limit"}:
+        _echo(
+            f"refused: {code}. The server is at a limit; wait and submit again.",
+            file=sys.stderr,
+        )
+        return THROTTLED
+
+    if code == "authentication_error":
+        _echo(
+            "refused: 401. The server has api_auth_enabled on. Set AWF_API_TOKEN or pass --token.",
+            file=sys.stderr,
+        )
+        return BAD_INPUT
+
+    if code == "run_already_exists":
+        _echo(
+            f"refused: {message}. A run with that id already exists. Resubmitting "
+            f"the same content replays it instead; pass --run-id to start a "
+            f"different one.",
+            file=sys.stderr,
+        )
+        return BAD_INPUT
+
+    _echo(f"refused: {message}", file=sys.stderr)
+    return BAD_INPUT
+
+
+def _report_run(detail: dict[str, Any], *, as_json: bool = False) -> int:
+    """Print a submitted run, or its verbatim payload when ``--json`` is set.
+
+    ``--json`` prints the server's payload unchanged. Reformatting it here would
+    mean this command had to learn about every field the API adds, and would
+    leave ``--json`` disagreeing with ``GET /v1/runs/{id}`` — which defeats the
+    purpose of a flag whose entire job is to make ``jq`` work.
+
+    Args:
+        detail: The ``RunDetail`` the server returned.
+        as_json: Print the payload verbatim instead of the summary.
+
+    Returns:
+        ``0`` for a finished run, :data:`NOT_DONE` for one waiting on a human.
+    """
+    if as_json:
+        _echo(json.dumps(detail, indent=2, sort_keys=True))
+        return 0 if detail.get("status") in {"completed", "rejected"} else NOT_DONE
+
+    run_id = str(detail.get("run_id", ""))
+    status = str(detail.get("status", ""))
+    usage = detail.get("usage") or {}
+
+    _rule(f"run {run_id} — {status}")
+    pending = detail.get("pending_approval")
+    if isinstance(pending, dict):
+        stage = pending.get("stage", "a human decision")
+        _echo(f"  waiting on: {stage} — {pending.get('title', '')}")
+    if detail.get("error"):
+        _echo(f"  error: {detail['error']}")
+    if usage.get("total_tokens") is not None:
+        _echo(
+            f"  usage: {usage['total_tokens']} tokens over {usage.get('calls', 0)} calls"
+            f" ({usage.get('prompt_tokens', 0)} in,"
+            f" {usage.get('completion_tokens', 0)} out)"
+        )
+    if detail.get("request_id"):
+        _echo(f"  request: {detail['request_id']}")
+
+    if status in {"completed", "rejected"}:
+        return 0
+
+    _echo(f"  follow it:  awf watch {run_id}")
+    _echo(f"  read it:    GET /v1/runs/{run_id}")
+    return NOT_DONE
+
+
+async def _cmd_run(args: argparse.Namespace) -> int:
+    """Submit a review to a running server.
+
+    The body is assembled entirely from local state before a socket is opened,
+    so a bad ``--file`` or ``--metadata`` costs nothing and names itself. The
+    ``X-Content-Hash`` header goes out with every submission, which is what
+    makes pressing enter twice return the original run instead of creating a
+    second one.
+
+    Args:
+        args: Parsed arguments for the ``run`` subcommand.
+
+    Returns:
+        The process exit code: ``0`` finished, :data:`NOT_DONE` parked on a
+        human, :data:`THROTTLED` refused by a budget, :data:`BAD_INPUT` for
+        anything the caller can fix. With ``--watch`` the code comes from
+        following the run instead, because how the run ended is the
+        longer-lived fact than how its submission was answered.
+    """
+    try:
+        files = _read_files(args.files)
+        metadata = _read_metadata(args.metadata)
+    except (OSError, ValueError) as exc:
+        _echo(str(exc), file=sys.stderr)
+        return BAD_INPUT
+
+    run_id = args.run_id or _run_id_for(args.title)
+    body: dict[str, Any] = {
+        "run_id": run_id,
+        "request_id": args.request_id or run_id,
+        "title": args.title,
+        "description": args.description,
+        "language": args.language,
+        "files": files,
+        "acceptance_criteria": args.acceptance_criteria,
+        "constraints": args.constraints,
+        "metadata": metadata,
+        "auto_resolve": args.auto_resolve,
+        "auto_decision": args.auto_decide,
+        "max_gates": args.max_gates,
+    }
+
+    try:
+        status, payload = await _submit(
+            args.url,
+            body,
+            content_hash=_content_hash(files, args.description),
+            token=args.token,
+            timeout=args.timeout,
+        )
+    except SubmissionError as exc:
+        _echo(str(exc), file=sys.stderr)
+        return BAD_INPUT
+
+    if status >= 400 or not isinstance(payload, dict):
+        code, message, context = _error_of(payload, status)
+        return _report_refusal(code, message, context)
+
+    if args.watch:
+        # The events that follow would be buried under a summary of the run
+        # they are events *of*, so with --watch only the stream is printed.
+        return await _watch(args.url, run_id, token=args.token)
+
+    return _report_run(payload, as_json=args.json)
 
 
 # --------------------------------------------------------------------------- #
@@ -836,6 +1287,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  awf eval --limit 5                    score against the golden set\n"
             "  awf janitor --dry-run                 preview checkpoint cleanup\n"
             "  awf watch pr-1042                      follow a run on a running server\n"
+            "  awf run --title 'fix totals' -f a.py  submit work to a running server\n"
+            "  awf run --title 'fix totals' --watch  submit it and follow the events\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"agentic-workflow {__version__}")
@@ -1026,7 +1479,134 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch.set_defaults(handler=_cmd_watch)
 
+    _add_run_parser(subparsers)
+
     return parser
+
+
+def _add_run_parser(subparsers: Any) -> None:
+    """Register the ``run`` subcommand.
+
+    Split out of the parser builder because this one carries a dozen arguments,
+    and inlining them would bury the other subcommands.
+
+    Args:
+        subparsers: The parser's subparser action.
+    """
+    run = subparsers.add_parser(
+        "run",
+        help="Submit a review to a running server.",
+        description=(
+            "Submit work to a server and print what it did with it. The files "
+            "are read locally and their contents sent, so the reviewed content "
+            "and the content on the wire are the same bytes. Every submission "
+            "carries an X-Content-Hash, so submitting the same work twice returns "
+            "the original run instead of starting a second one. A run parked on a "
+            "human decision exits 1; a run refused by a budget exits 3, because "
+            "that run never started and waiting for it would wait forever."
+        ),
+    )
+    run.add_argument("--title", required=True, help="One-line subject of the review.")
+    run.add_argument(
+        "--file",
+        dest="files",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="File to review; repeat for several. The path is sent as its name.",
+    )
+    run.add_argument("--description", default="", help="The problem statement.")
+    run.add_argument("--language", default="python", help="Primary language (default: python).")
+    run.add_argument(
+        "--run-id",
+        dest="run_id",
+        default=None,
+        help="Run id (default: the title, slugged). Also the handle `awf watch` takes.",
+    )
+    run.add_argument(
+        "--request-id",
+        dest="request_id",
+        default=None,
+        help="Business id such as a PR number (default: the run id).",
+    )
+    run.add_argument(
+        "--metadata",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Correlation data echoed back on every read of the run; repeatable.",
+    )
+    run.add_argument(
+        "--criteria",
+        dest="acceptance_criteria",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="Condition the report must satisfy; repeatable.",
+    )
+    run.add_argument(
+        "--constraint",
+        dest="constraints",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="Hard limit the agents must respect; repeatable.",
+    )
+    run.add_argument(
+        "--auto-resolve",
+        dest="auto_resolve",
+        action="store_true",
+        help="Answer every human gate automatically and run to completion in one call.",
+    )
+    run.add_argument(
+        "--auto-decide",
+        dest="auto_decide",
+        choices=("approve", "edit", "reject"),
+        default="approve",
+        help="Verdict used with --auto-resolve (default: approve).",
+    )
+    run.add_argument(
+        "--max-gates",
+        dest="max_gates",
+        type=int,
+        default=32,
+        help="Safety bound on auto-resolved gates (default: 32).",
+    )
+    run.add_argument(
+        "--watch",
+        action="store_true",
+        help="Follow the run's events after submitting it.",
+    )
+    run.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Print the server's response verbatim, for jq.",
+    )
+    run.add_argument(
+        "--url",
+        default=os.environ.get("AWF_API_URL", "http://localhost:8000"),
+        help="Server to submit to (default: $AWF_API_URL, else http://localhost:8000).",
+    )
+    run.add_argument(
+        "--token",
+        default=os.environ.get("AWF_API_TOKEN"),
+        help=(
+            "Bearer token for a server with api_auth_enabled (default: "
+            "$AWF_API_TOKEN). Sent as an Authorization header, never in the URL."
+        ),
+    )
+    run.add_argument(
+        "--timeout",
+        type=float,
+        default=900.0,
+        help=(
+            "Seconds to wait for the response (default: 900). A submission drives "
+            "the whole graph, so keep this at or above the server's "
+            "run_timeout_seconds or you will abandon a run that is still working."
+        ),
+    )
+    run.set_defaults(handler=_cmd_run)
 
 
 async def _run(args: argparse.Namespace) -> int:

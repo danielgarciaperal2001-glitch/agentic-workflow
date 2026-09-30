@@ -27,6 +27,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -278,6 +279,101 @@ class TestExitCodes:
 
         loud = run_cli("eval", "--provider", "nonexistent", env=(("AWF_CLI_TRACE", "1"),))
         assert "Traceback (most recent call last)" in loud.stderr
+
+
+class TestRun:
+    """``awf run`` as a process: the argument wiring nothing else can see.
+
+    ``tests/integration/test_cli_run.py`` builds ``argparse.Namespace`` objects by
+    hand, which is deliberate — it lets one test vary a single field — but it
+    means every one of those tests would pass unchanged if ``--file`` were wired
+    to ``--path`` or the handler were never attached. Those are exactly the bugs
+    a CLI has and a library does not, so the flags are exercised as a command.
+    """
+
+    def test_the_command_is_listed_in_help(self) -> None:
+        """A feature nobody can find is a feature nobody has."""
+        result = run_cli("--help")
+        assert result.returncode == 0
+        assert "run" in result.stdout
+
+    def test_the_title_is_required(self) -> None:
+        """A review with no subject is not a review, and argparse says so.
+
+        Making it optional would only move the failure: the id is derived from the
+        title, so without one there would be no id to report back and nothing for
+        ``awf watch`` to follow.
+        """
+        result = run_cli("run")
+        assert result.returncode == 2, result.stderr
+        assert "--title" in result.stderr
+
+    def test_an_unreachable_server_is_bad_input_and_not_a_traceback(self, tmp_path: Any) -> None:
+        """A server that is not there is a configuration problem, reported as one.
+
+        This is the first failure a user meets, and the exit code has to
+        distinguish it from a run that is merely unfinished, or a script that
+        polls ``awf run`` would retry a typo'd port forever.
+        """
+        source = tmp_path / "a.py"
+        source.write_text("x = 1\n", encoding="utf-8")
+
+        result = run_cli(
+            "run",
+            "--title",
+            "unreachable",
+            "--file",
+            str(source),
+            "--url",
+            "http://127.0.0.1:9",
+            "--timeout",
+            "5",
+        )
+        assert result.returncode == 2, result.stderr
+        assert "cannot reach" in result.stderr
+        assert "Traceback (most recent call last)" not in result.stderr
+
+    def test_a_missing_file_names_the_path_and_sends_nothing(self, tmp_path: Any) -> None:
+        """A typo in ``--file`` is caught locally, and the path is in the message.
+
+        The port is one nothing listens on, so if the command tried to submit
+        before reading, the message would be "cannot reach" instead of naming the
+        file. Both outcomes exit 2, which is why the assertion is on the text.
+        """
+        absent = tmp_path / "not-here.py"
+
+        result = run_cli(
+            "run",
+            "--title",
+            "missing file",
+            "--file",
+            str(absent),
+            "--url",
+            "http://127.0.0.1:9",
+        )
+        assert result.returncode == 2, result.stderr
+        assert "not-here.py" in result.stderr
+        assert "cannot reach" not in result.stderr
+
+    def test_a_malformed_metadata_pair_is_rejected_locally(self) -> None:
+        """``--metadata`` without an ``=`` is a typo, not a server error.
+
+        Forwarding it would produce a validation message about the ``metadata``
+        field of the body — a name the user never typed — instead of about the
+        argument they actually got wrong.
+        """
+        result = run_cli(
+            "run",
+            "--title",
+            "bad metadata",
+            "--metadata",
+            "justakey",
+            "--url",
+            "http://127.0.0.1:9",
+        )
+        assert result.returncode == 2, result.stderr
+        assert "--metadata" in result.stderr
+        assert "cannot reach" not in result.stderr
 
 
 class TestWatch:

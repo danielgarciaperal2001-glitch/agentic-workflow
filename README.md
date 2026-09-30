@@ -358,21 +358,34 @@ awf replay <run_id> --index -1   # time travel: fork from any checkpoint
 awf topology               # nodes, edges, loops, routing table
 awf eval [--gate ...] [--json]  # score the golden dataset
 awf janitor [--dry-run]    # one checkpoint-retention pass
+awf run --title ... -f a.py   # submit a review to a running server
 awf watch <run_id>         # follow a run on a running server, as it happens
 ```
 
 The first five run locally against their own engine and need no network and no
-credentials. `watch` is the exception: it is a client, and it needs a server to
-talk to.
+credentials. `run` and `watch` are the exception: they are clients, and they need
+a server to talk to.
 
 ```bash
 awf watch pr-1042                                  # http://localhost:8000
 awf watch pr-1042 --url http://prod:8000           # somewhere else
 AWF_API_TOKEN=… awf watch pr-1042 --url wss://prod # auth via the environment
+
+awf run --title 'fix totals' -f src/checkout.py    # submit and print the result
+awf run --title 'fix totals' -f src/checkout.py --auto-resolve
+awf run --title 'fix totals' -f src/checkout.py --watch   # submit, then follow
 ```
 
-Exit codes: `0` ok, `1` not done, `2` bad input, `130` interrupted. Set
-`AWF_CLI_TRACE=1` for a traceback.
+`awf run` sends an `X-Content-Hash` with every submission, so submitting the same
+work twice returns the original run instead of starting a second one. Its token
+travels as an `Authorization` header — `watch` cannot, because a WebSocket
+handshake carries no headers, which is why that token rides in the query string
+instead.
+
+Exit codes: `0` ok, `1` not done, `2` bad input, `3` refused by a budget,
+`130` interrupted. Code `3` exists because a run refused by the per-run token
+budget never started: treating it as "not done" would have a script poll
+forever for a run that does not exist. Set `AWF_CLI_TRACE=1` for a traceback.
 
 Logs go to **stderr**; results to **stdout**. `awf eval --json | jq` works.
 
