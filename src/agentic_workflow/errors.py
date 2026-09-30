@@ -55,6 +55,11 @@ class ErrorCode(StrEnum):
     CHECKPOINT_NOT_FOUND = "checkpoint_not_found"
     CONNECTION_ERROR = "connection_error"
 
+    # --- budget ----------------------------------------------------------- #
+    # `noqa: S105` — the rule reads any constant containing "TOKEN" as a secret.
+    # This is an enum member name in the public error vocabulary, not a credential.
+    TOKEN_BUDGET_EXCEEDED = "token_budget_exceeded"  # noqa: S105
+
     # --- provider / agent ------------------------------------------------ #
     PROVIDER_ERROR = "provider_error"
     PROVIDER_RATE_LIMITED = "provider_rate_limited"
@@ -216,6 +221,30 @@ class ConcurrencyLimitError(WorkflowError):
 
     code = ErrorCode.CONCURRENCY_LIMIT
     retryable = True
+
+
+class TokenBudgetExceededError(WorkflowError):
+    """The run reached the token ceiling configured for it.
+
+    A :class:`WorkflowError` rather than a bare exception so the ``@node`` wrapper
+    passes it through with its context intact instead of folding it into an
+    ``AgentError``. That distinction is the whole reason the client sees a budget
+    rather than a generic 500: the two statuses mean different things to whoever
+    is retrying, and a 500 invites a retry that spends the same tokens to reach
+    the same answer.
+
+    Attributes:
+        budget: The ceiling that was crossed, in tokens.
+        spent: The run's total once it crossed it. Above ``budget``, because the
+            refusal happens *after* the completion that crossed the line — the
+            cost of a call is only knowable once it has been paid for.
+    """
+
+    code = ErrorCode.TOKEN_BUDGET_EXCEEDED
+    # Not retryable: the same payload spends the same tokens. Retrying is only
+    # sensible after the operator raises the ceiling, which is a decision rather
+    # than a wait.
+    retryable = False
 
 
 # --------------------------------------------------------------------------- #
@@ -403,5 +432,6 @@ __all__ = [
     "RunNotFoundError",
     "RunTimeoutError",
     "SchemaValidationError",
+    "TokenBudgetExceededError",
     "WorkflowError",
 ]

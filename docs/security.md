@@ -23,6 +23,7 @@ it, and who can prove they are who they say they are".
 | `AWF_HITL_REQUIRE_SIGNATURE` | `true` | The audit log claims to be tamper-evident, so it says so loudly when it cannot be. |
 | `AWF_HITL_SIGNING_SECRET` | — | Falls back to `AWF_API_AUTH_TOKEN`. Deliberately never to `AWF_LLM_API_KEY`. |
 | `AWF_API_RATE_LIMIT_PER_MINUTE` | `120` | Bounds guessing, and bounds a runaway client. Not an authentication mechanism. |
+| `AWF_LLM_TOKEN_BUDGET_PER_RUN` | `500000` | Bounds what one request can cost. The request budget above does not: it counts requests, and one request was measured from 6,472 tokens to 4,060,022. `0` disables it. |
 | `AWF_API_TRUST_FORWARDED_FOR` | `false` | A caller can write `X-Forwarded-For`. Off unless a proxy overwrites it. |
 | `AWF_API_DOCS_ENABLED` | `true`, removed in production | An API description is a map of the control plane. |
 

@@ -155,7 +155,9 @@ Then, in order:
 2. **`ConfigurationError`** — an environment variable is wrong. The message
    names the offending field.
 3. **`RateLimitExceeded`** (429) — `AWF_API_RATE_LIMIT_PER_MINUTE` is too low for
-   your client, or something is looping.
+   your client, or something is looping. Check the `code` in the body: a 429
+   carrying `token_budget_exceeded` instead is a different ceiling entirely, and
+   is entry 7.
 4. **A WebSocket handshake answered 403** — an observer cap was reached. The
    `ws.rejected` log line says which one: `scope=run` is
    `AWF_WS_MAX_CONNECTIONS_PER_RUN` and is normal on a dashboard-heavy
@@ -183,6 +185,22 @@ Then, in order:
    restart and answer on any replica. If a run you started has neither in the log
    nor on `GET /v1/runs/{id}`, check that the caller actually sent them: an empty
    `metadata` is stored and returned as `{}`, it is never inferred.
+7. **A run was refused for costing too much** (`429`, `token_budget_exceeded`) —
+   the run reached `AWF_LLM_TOKEN_BUDGET_PER_RUN` and stopped, with
+   `budget`, `spent` and `calls` in the body's `context`. This is a ceiling on
+   one run, not a quota: nothing is refunded, and the tokens spent before the
+   refusal are still charged and still reported by
+   `GET /v1/runs/{id}/usage`, so read that endpoint to see what the run cost
+   before deciding anything. The `spent` figure overshoots `budget` by at most
+   one call, because a call's cost is only known once the provider has answered
+   it — the refusal stops the *next* call. Two honest responses: raise the
+   ceiling if the review was legitimately that large, or submit less if the
+   payload was a mistake. A client retrying unchanged will spend the same
+   tokens to reach the same answer, which is why the error is marked
+   `retryable: false`. The per-minute request budget does not stand in for
+   this one: it bounds how many requests arrive, and one request was measured
+   from 6,472 tokens for a single small file to 4,060,022 at the 200-file wire
+   limit.
 
 ### Postgres-backed runs cannot be read
 
@@ -454,6 +472,7 @@ Everything is `AWF_`-prefixed. The ones worth knowing by heart:
 | `AWF_RECOVERY_MAX_RUNS` | `1000` | Ceiling on runs rehydrated into the registry on boot. Bounds the listing, never access to a run by id. |
 | `AWF_LLM_PROVIDER` | `echo` | `echo` (offline, deterministic) or `openai_compatible`. |
 | `AWF_LLM_API_KEY` | — | Required for a real provider. |
+| `AWF_LLM_TOKEN_BUDGET_PER_RUN` | `500000` | Ceiling on the tokens one run may spend. `0` disables it. |
 | `AWF_HITL_ENABLED` | `true` | Master switch for human gates. |
 | `AWF_HITL_ESCALATION_THRESHOLD` | `0.70` | Confidence below which a human is asked. |
 | `AWF_HITL_SIGNING_SECRET` | — | Key that signs decisions. Falls back to `AWF_API_AUTH_TOKEN`. |

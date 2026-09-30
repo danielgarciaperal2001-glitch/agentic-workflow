@@ -43,6 +43,12 @@ log = get_logger(__name__)
 #: * ``ConcurrencyLimitError`` maps to ``429`` rather than ``503``. The server is
 #:   fine; the caller arrived while the budget was spent, and the response says
 #:   "retry", which is exactly the truth.
+#: * ``TokenBudgetExceededError`` maps to ``429`` for the same reason, and the
+#:   difference from the concurrency case is in the ``retryable`` flag rather than
+#:   the status: the budget is per run, so the answer is to submit less work, not
+#:   to come back later. A 5xx here would be worse than merely unhelpful — it
+#:   tells a retrying client that the server broke, when the server is precisely
+#:   the thing working as configured.
 STATUS_MAP: Final[dict[ErrorCode, int]] = {
     # --- validation ------------------------------------------------------- #
     ErrorCode.INVALID_REQUEST: status.HTTP_400_BAD_REQUEST,
@@ -58,6 +64,7 @@ STATUS_MAP: Final[dict[ErrorCode, int]] = {
     ErrorCode.GRAPH_ERROR: status.HTTP_500_INTERNAL_SERVER_ERROR,
     ErrorCode.AGENT_ERROR: status.HTTP_500_INTERNAL_SERVER_ERROR,
     ErrorCode.CONCURRENCY_LIMIT: status.HTTP_429_TOO_MANY_REQUESTS,
+    ErrorCode.TOKEN_BUDGET_EXCEEDED: status.HTTP_429_TOO_MANY_REQUESTS,
     # --- human-in-the-loop ------------------------------------------------ #
     ErrorCode.APPROVAL_REQUIRED: status.HTTP_202_ACCEPTED,
     ErrorCode.APPROVAL_NOT_FOUND: status.HTTP_404_NOT_FOUND,

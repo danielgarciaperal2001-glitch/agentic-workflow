@@ -399,20 +399,62 @@ class UsageScopedClient(LLMClient):
     schema-repair retries always are. The engine binds one of these per drive
     and accumulates the run's total across drives in the registry.
 
+    This is also where a run's token ceiling is enforced, and the reason is that
+    it is the one place that knows the spend as it happens. A check after the
+    drive would be a report rather than a limit: measured through the real
+    endpoint, one submission of 200 files costs 4.06M tokens, so by the time a
+    post-hoc check could run every one of them was already paid for. Refusing
+    here means the *next* call is the one that does not happen.
+
+    The check is after the merge rather than before the call, because a
+    completion's cost is only knowable once the provider has answered. So
+    ``spent`` overshoots ``budget`` by at most one call, and the overshoot is
+    charged and reported rather than discarded: the tokens were spent either way.
+
     Args:
         delegate: The client that actually talks to the provider. Ownership
             stays with the caller: closing a wrapper never closes the delegate.
+        budget: Ceiling on this run's total tokens, or ``0`` for unbounded. The
+            run's *whole* total, not this drive's share, so a run that is resumed
+            cannot reset its ceiling by parking more often.
+        spent_before: What the run had already spent in earlier drives. Read
+            from the registry when the wrapper is built, so a multi-drive run is
+            measured as one bill.
+        run_id: The run these tokens are charged to, for the error's context.
     """
 
-    def __init__(self, delegate: LLMClient) -> None:
+    def __init__(
+        self,
+        delegate: LLMClient,
+        *,
+        budget: int = 0,
+        spent_before: Usage | None = None,
+        run_id: str = "",
+    ) -> None:
         super().__init__(**{name: getattr(delegate, name) for name in _PROVIDER_FIELDS})
         self.delegate = delegate
         self._usage = Usage()
+        self._budget = budget
+        self._spent_before = spent_before or Usage()
+        self._run_id = run_id
 
     @property
     def usage(self) -> Usage:
         """The usage attributed to this wrapper so far."""
         return self._usage
+
+    @property
+    def run_total(self) -> Usage:
+        """The whole run's usage: earlier drives plus this one.
+
+        The budget is per run, so this is the number the ceiling is compared
+        against. A drive-local total would let a caller reset the budget by
+        making the run park, which is the opposite of what a ceiling is for.
+
+        Returns:
+            The merged usage across every drive of this run.
+        """
+        return self._spent_before.merge(self._usage)
 
     @property
     def total_usage(self) -> Usage:
@@ -442,17 +484,51 @@ class UsageScopedClient(LLMClient):
         response_format: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> Completion:
-        """Delegate to the shared client and record the call's usage.
+        """Delegate to the shared client, record the call, then hold the ceiling.
 
         The delegate handles the concurrency semaphore, retries and timeouts;
         this method only observes the response, so the process-wide ceiling is
         untouched and attribution is exact per completed call.
+
+        The budget check sits after the merge and before returning, so the run
+        that crosses its ceiling still gets the completion it paid for and the
+        *next* call is what raises. Checking before the call would be tidier on
+        paper and wrong in practice: the cost of a call is unknown until the
+        provider answers, so a pre-check would either refuse calls that would
+        have fit or admit calls that would not.
+
+        Raises:
+            TokenBudgetExceededError: If this completion took the run past its
+                configured ceiling.
         """
         completion = await self.delegate.complete(
             messages, response_format=response_format, **kwargs
         )
         self._usage = self._usage.merge(completion.usage)
+        self._enforce_budget()
         return completion
+
+    def _enforce_budget(self) -> None:
+        """Raise if the run has spent more than its ceiling allows.
+
+        Raises:
+            TokenBudgetExceededError: If a budget is configured and the run's
+                total now exceeds it.
+        """
+        if self._budget <= 0:
+            return
+        total = self.run_total
+        if total.total_tokens <= self._budget:
+            return
+        from agentic_workflow.errors import TokenBudgetExceededError
+
+        raise TokenBudgetExceededError(
+            f"run exceeded its {self._budget} token budget",
+            run_id=self._run_id,
+            budget=self._budget,
+            spent=total.total_tokens,
+            calls=total.calls,
+        )
 
     async def aclose(self) -> None:
         """Release nothing: the delegate is the engine's, not this wrapper's.

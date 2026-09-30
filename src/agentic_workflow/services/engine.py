@@ -1135,21 +1135,28 @@ class WorkflowEngine:
         underlying client, which is what makes the provider concurrency ceiling
         mean what the setting says. Each drive's wrapper is fresh, so the
         drive's completions can be attributed to it alone.
+
+        *run_id* reaches the wrapper on every path, not just the one that builds
+        a context from scratch, because the wrapper needs it for two things: the
+        run's prior spend, so the token ceiling spans every drive, and the run id
+        the refusal carries. A template context that kept an unbound wrapper
+        would reset the budget on each resume, which is the hole the ceiling is
+        meant to close.
         """
         if context is not None:
-            return self._bind_client(context)
+            return self._bind_client(context, run_id)
         template = self._context_template
         if template is None:
             return AgentContext(
                 settings=self._settings,
-                llm=self._scoped_llm(),
+                llm=self._scoped_llm(run_id),
                 emit=self._event_sink,
             )
         if self._event_sink is None or template.emit is not None:
-            return self._bind_client(template)
-        return self._bind_client(replace(template, emit=self._scoped_sink(run_id)))
+            return self._bind_client(template, run_id)
+        return self._bind_client(replace(template, emit=self._scoped_sink(run_id)), run_id)
 
-    def _bind_client(self, context: AgentContext) -> AgentContext:
+    def _bind_client(self, context: AgentContext, run_id: str = "") -> AgentContext:
         """Return *context* carrying the process-wide client when it has none.
 
         A client the caller supplied is left exactly as it is: the engine does
@@ -1158,8 +1165,16 @@ class WorkflowEngine:
         unset would let the lazy accessor build a private client per run and
         silently multiply the configured ceiling.
 
+        A wrapper the caller supplied is likewise left alone, including the
+        budget it was built with. The engine cannot account for tokens it did not
+        see the provider charge, so it has no basis for either enforcing or
+        clearing a ceiling here; the run's spend is then whatever that wrapper
+        recorded, and ``/usage`` reports it honestly as partial.
+
         Args:
             context: A context that may or may not already carry a client.
+            run_id: The run this context belongs to, passed to the engine's own
+                wrapper so the ceiling spans the run's drives.
 
         Returns:
             The same context, or a copy of it with the client filled in. The
@@ -1167,9 +1182,9 @@ class WorkflowEngine:
         """
         if context.llm is not None:
             return context
-        return replace(context, llm=self._scoped_llm())
+        return replace(context, llm=self._scoped_llm(run_id))
 
-    def _scoped_llm(self) -> UsageScopedClient:
+    def _scoped_llm(self, run_id: str = "") -> UsageScopedClient:
         """Wrap the process-wide client so this drive is charged for its calls.
 
         The wrapper shares the underlying client — same semaphore, retries and
@@ -1177,8 +1192,31 @@ class WorkflowEngine:
         caused it. One wrapper per drive keeps the run's attribution open for
         the whole drive and lets the outcome report exactly what that drive
         spent.
+
+        The run's token ceiling rides on the same wrapper because this is where
+        the spend is observable as it happens. The prior spend is read from the
+        registry rather than tracked here, so a run that parks and is resumed is
+        measured as one bill: a per-drive budget could be reset by making the run
+        park more often, which is the opposite of what a ceiling is for.
+
+        Args:
+            run_id: The run this drive belongs to, carried for the error's
+                context. Empty for a wrapper built outside a run.
+
+        Returns:
+            A wrapper over the process-wide client.
         """
-        return UsageScopedClient(self._shared_llm())
+        spent_before = Usage()
+        if run_id:
+            record = self._registry.find(run_id)
+            if record is not None:
+                spent_before = record.usage
+        return UsageScopedClient(
+            self._shared_llm(),
+            budget=self._settings.llm_token_budget_per_run,
+            spent_before=spent_before,
+            run_id=run_id,
+        )
 
     def _attach_usage(self, ctx: AgentContext, outcome: RunOutcome) -> RunOutcome:
         """Attribute this drive's completions to the run and record them.

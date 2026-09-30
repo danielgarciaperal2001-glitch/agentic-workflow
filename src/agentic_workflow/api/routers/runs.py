@@ -95,7 +95,17 @@ def _outcome_status(outcome: RunOutcome) -> int:
     responses={
         ACCEPTED: {"description": "The run parked on a human gate."},
         409: {"description": "The run id is already in use."},
-        429: {"description": "The concurrency or request budget is exhausted."},
+        429: {
+            "description": (
+                "A budget was exhausted. The `code` in the body says which: "
+                "`concurrency_limit` for too many runs in flight, "
+                "`rate_limited` for too many requests, and "
+                "`token_budget_exceeded` when the run itself reached "
+                "`llm_token_budget_per_run`. The last is not retryable — the "
+                "same payload spends the same tokens — so the answer is a smaller "
+                "submission or a higher ceiling, not another attempt."
+            )
+        },
     },
 )
 async def start_run(
@@ -124,6 +134,11 @@ async def start_run(
         RunAlreadyExistsError: If the run id is taken and the content hash does
             not match.
         InvalidRequestError: If ``X-Content-Hash`` disagrees with the body.
+        TokenBudgetExceededError: If the run reaches
+            ``llm_token_budget_per_run``. Raised mid-drive rather than reported
+            afterwards, so the call that would have crossed the ceiling is the
+            one that does not happen. What was already spent is still attributed
+            to the run and still readable at ``GET /v1/runs/{id}/usage``.
     """
     request = body.to_domain()
     if content_hash is not None and content_hash != request.content_hash:

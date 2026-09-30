@@ -258,6 +258,24 @@ class Settings(BaseSettings):
         le=512,
         description="Client-side semaphore size guarding provider rate limits.",
     )
+    llm_token_budget_per_run: int = Field(
+        default=500_000,
+        ge=0,
+        le=1_000_000_000,
+        description=(
+            "Ceiling on the total LLM tokens one run may spend, across every "
+            "drive of that run. `0` disables it, as it does for "
+            "`api_rate_limit_per_minute`. The default is measured, not guessed: "
+            "sweeping the payloads the wire accepts through POST /v1/runs gave "
+            "6.5k tokens for a single small file, 328k for a 20-file diff and "
+            "4.06M at the 200-file wire limit — 627x between the smallest useful "
+            "submission and the largest legal one. This admits a real diff and "
+            "refuses a payload that is a mistake. Raise it for a deployment whose "
+            "reviews are legitimately larger; the refusal is per run, not a quota, "
+            "so nothing is refunded and the tokens spent before it are still "
+            "charged and still reported by /v1/runs/{id}/usage."
+        ),
+    )
 
     # ---------------------------------------------------------- postgres #
     postgres_enabled: bool = Field(
@@ -651,6 +669,7 @@ class Settings(BaseSettings):
             "llm_provider": self.llm_provider.value,
             "llm_model": self.llm_model,
             "llm_api_key": self.masked_api_key(),
+            "llm_token_budget_per_run": self.llm_token_budget_per_run,
             "postgres_enabled": self.postgres_enabled,
             "api_auth_enabled": self.api_auth_enabled,
             "hitl_enabled": self.hitl_enabled,
