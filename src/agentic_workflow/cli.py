@@ -1,6 +1,6 @@
 """Command-line entry point: ``awf`` / ``agentic-workflow``.
 
-Five subcommands, chosen so that every claim the README makes can be checked from
+Six subcommands, chosen so that every claim the README makes can be checked from
 a terminal without starting the API or writing a test:
 
 * ``demo`` — run a real review end to end, pausing at each human gate.
@@ -8,11 +8,14 @@ a terminal without starting the API or writing a test:
 * ``topology`` — print the graph's nodes, edges, cycles and routing table.
 * ``eval`` — score the workflow's output quality against a golden dataset.
 * ``janitor`` — one checkpoint-retention pass.
+* ``watch`` — follow a run on a *running server*, as it happens.
 
 Design notes:
 
-* **No network, no credentials required.** The default provider is ``echo``, so
-  ``awf demo`` works on a fresh clone and in CI. ``--provider`` switches it.
+* **No network, no credentials required** for the first five. The default
+  provider is ``echo``, so ``awf demo`` works on a fresh clone and in CI.
+  ``--provider`` switches it. ``watch`` is the exception and is a client: it
+  talks to a server over a WebSocket, and needs one to talk to.
 * **Exit codes mean something.** ``0`` success, ``1`` the run did not reach a
   successful terminal state, ``2`` bad input. A CI job can gate on this.
 * **Failures print the error class, not a traceback.** A traceback from a CLI
@@ -26,10 +29,11 @@ import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 import json
-import os as _os
+import os
 from pathlib import Path
 import sys
 from typing import Any
+from urllib.parse import quote
 
 from agentic_workflow import __version__
 
@@ -202,6 +206,205 @@ def _demo_request(run_id: str) -> Any:
         constraints=["Keep the public signature of `total` unchanged."],
         metadata={"repo": "acme/checkout", "author": "team-payments"},
     )
+
+
+# --------------------------------------------------------------------------- #
+# Watching a run on a server
+# --------------------------------------------------------------------------- #
+#: The event that opens a stream, before any run state.
+STREAM_OPEN = "stream.open"
+#: The event carrying the run's state at the moment the client attached.
+STREAM_SNAPSHOT = "stream.snapshot"
+#: Keep-alive frame, and the only channel a loss is reported on.
+HEARTBEAT = "heartbeat"
+
+#: The event after which the server closes the socket.
+#:
+#: Kept here rather than imported from the API package: `watch` is a *client*,
+#: and a client that imports the server's constants stops noticing when the
+#: server changes them. The names are the wire contract, and the contract is
+#: duplicated on purpose so a rename shows up as a test failure instead of
+#: silently agreeing with itself.
+TERMINAL_EVENT_NAMES = frozenset(
+    {"run.completed", "run.failed", "run.cancelled", "run.interrupted", "run.rejected"}
+)
+
+
+def _format_frame(frame: dict[str, Any]) -> list[str]:
+    """Render one wire frame as the lines a terminal should show.
+
+    Returns lines rather than printing them, because the decision of *whether*
+    to print is part of the protocol: a keep-alive is not information, and a
+    formatter that always returned a line would have the caller deciding that
+    instead.
+
+    Args:
+        frame: One decoded JSON frame from the stream.
+
+    Returns:
+        The lines to print, or an empty list for a frame that carries nothing
+        worth showing.
+    """
+    name = str(frame.get("event") or "")
+
+    if name == HEARTBEAT:
+        # The only frame that can report a loss, and the reason a client cannot
+        # detect one itself: `seq` counts publications across every run, so the
+        # gaps a subscriber sees belong to other runs, and because the loss is
+        # always the *oldest* event it lands at the head of the queue where no
+        # gap appears at all. A watcher that printed the rest of the stream as
+        # though it were complete would be the one dishonest thing this command
+        # could do.
+        lost = frame.get("dropped_since_last")
+        if isinstance(lost, int) and lost > 0:
+            return [
+                (
+                    f"  ⚠ dropped {lost} event(s) — this view has a hole in it; "
+                    f"the run itself is unaffected"
+                )
+            ]
+        return []
+
+    if name == STREAM_SNAPSHOT:
+        lines = [f"snapshot  {frame.get('status', '?')}"]
+        pending = frame.get("pending_approval")
+        if isinstance(pending, dict):
+            stage = pending.get("stage", "?")
+            lines.append(f"  waiting on {stage}: {pending.get('title', '?')}")
+            rationale = pending.get("rationale")
+            if rationale:
+                lines.append(f"  why: {rationale}")
+        report = frame.get("report")
+        if isinstance(report, dict) and report.get("verdict"):
+            lines.append(f"  verdict: {report['verdict']}")
+        return lines
+
+    if name == STREAM_OPEN:
+        # Proof of life, and the only place the heartbeat interval is visible.
+        # Not printed: the caller has already said it is connecting, and a
+        # "connected" line is noise before anything has happened.
+        return []
+
+    if name in TERMINAL_EVENT_NAMES:
+        return [f"── {name}"]
+
+    if not name:
+        # A frame with no event name is malformed. Reported rather than dropped:
+        # silently skipping frames is how a watcher ends up showing a run that
+        # has gone quiet at the exact moment something happened to it.
+        return [f"  ? unrecognised frame: {json.dumps(frame, default=str)[:120]}"]
+
+    detail = frame.get("node") or frame.get("stage") or ""
+    suffix = f"  {detail}" if detail else ""
+    return [f"{name}{suffix}"]
+
+
+async def _watch(
+    base_url: str,
+    run_id: str,
+    *,
+    token: str | None = None,
+    max_frames: int = 0,
+    quiet: bool = False,
+) -> int:
+    """Follow one run's event stream and print it until the run ends.
+
+    The client half of the WebSocket protocol. Three properties of the server's
+    stream shape what this can do, and each is a decision rather than an
+    accident:
+
+    * The first content frame is a **snapshot**, so attaching late still shows
+      where the run is. Without it, watching a run that has been parked on a
+      human gate for an hour shows an empty screen until the next event, which
+      may never come.
+    * A **terminal event closes the socket**, so waiting for more after
+      ``run.completed`` would hang forever. The wait ends on that event. A run
+      that had already finished is replayed onto this subscription from the
+      snapshot's status, so attaching late ends the stream too.
+    * A **loss is reported on the heartbeat channel**, and a client that ignored
+      it would print a stream with a hole in it and say nothing.
+
+    Args:
+        base_url: HTTP or WebSocket origin of the server, with or without a
+            trailing slash.
+        run_id: The run to follow.
+        token: Bearer token for a server with ``api_auth_enabled``. It travels in
+            the query string because a WebSocket handshake cannot carry an
+            ``Authorization`` header from a browser, and the server reads it from
+            there. That is why the default is the environment: a token typed on
+            the command line is in the shell history and in ``ps`` output.
+        max_frames: Stop after this many frames. ``0`` means never, which is what
+            an interactive watch wants; a bounded value is how a test stops a
+            follow of a run that is not going to finish.
+        quiet: Suppress per-frame output, keeping only the summary. Used by the
+            tests, which assert on the return value rather than on the text.
+
+    Returns:
+        ``0`` when the run reached a successful terminal state, ``NOT_DONE`` for
+        any other ending, ``BAD_INPUT`` when the server could not be reached or
+        refused the connection.
+    """
+    import websockets
+
+    origin = base_url.rstrip("/")
+    if origin.startswith("http://"):
+        origin = f"ws://{origin[len('http://') :]}"
+    elif origin.startswith("https://"):
+        origin = f"wss://{origin[len('https://') :]}"
+    url = f"{origin}/ws/runs/{run_id}"
+    if token:
+        url = f"{url}?token={quote(token, safe='')}"
+
+    terminal: str | None = None
+    seen = 0
+    try:
+        async with websockets.connect(url) as socket:
+            while True:
+                raw = await socket.recv()
+                try:
+                    frame = json.loads(raw)
+                except json.JSONDecodeError:
+                    lines = [f"  ? unparseable frame: {str(raw)[:120]}"]
+                else:
+                    lines = _format_frame(frame)
+
+                name = str(frame.get("event") or "") if isinstance(frame, dict) else ""
+                seen += 1
+                if not quiet:
+                    for line in lines:
+                        _echo(line)
+                if name in TERMINAL_EVENT_NAMES:
+                    terminal = name
+                    break
+                if max_frames and seen >= max_frames:
+                    break
+    except OSError as exc:
+        # One line naming the address, not a traceback: a watcher pointed at a
+        # host that is not there has to be able to tell which host. The query
+        # string is dropped for the same reason the token went in it — this line
+        # goes to stderr, which is exactly where a pasted secret gets collected.
+        _echo(f"cannot reach {url.split('?')[0]}: {exc}", file=sys.stderr)
+        return BAD_INPUT
+    except Exception as exc:  # websockets raises its own hierarchy
+        _echo(f"watch failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return BAD_INPUT
+
+    if terminal is None:
+        return NOT_DONE
+    return 0 if terminal == "run.completed" else NOT_DONE
+
+
+async def _cmd_watch(args: argparse.Namespace) -> int:
+    """Follow a run on a running server.
+
+    Args:
+        args: Parsed arguments carrying ``url``, ``run_id``, ``token`` and
+            ``max_frames``.
+
+    Returns:
+        The process exit code.
+    """
+    return await _watch(args.url, args.run_id, token=args.token, max_frames=args.max_frames)
 
 
 # --------------------------------------------------------------------------- #
@@ -391,7 +594,7 @@ def _operator_name() -> str:
     Returns:
         A reviewer name for the audit log.
     """
-    default = _os.environ.get("USER") or _os.environ.get("USERNAME") or "operator"
+    default = os.environ.get("USER") or os.environ.get("USERNAME") or "operator"
     if not sys.stdin.isatty():  # pragma: no cover - piped input
         return default
     try:
@@ -632,6 +835,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  awf replay <run-id> --index 3         re-execute from a checkpoint\n"
             "  awf eval --limit 5                    score against the golden set\n"
             "  awf janitor --dry-run                 preview checkpoint cleanup\n"
+            "  awf watch pr-1042                      follow a run on a running server\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"agentic-workflow {__version__}")
@@ -785,6 +989,43 @@ def build_parser() -> argparse.ArgumentParser:
     janitor.add_argument("--json", action="store_true", help="Emit raw JSON.")
     janitor.set_defaults(handler=_cmd_janitor)
 
+    watch = subparsers.add_parser(
+        "watch",
+        help="Follow a run's event stream on a running server.",
+        description=(
+            "Follow a run that is happening somewhere else. Prints the run's "
+            "current state, then every event, and exits when the run reaches a "
+            "terminal state. The stream drops events for a client that cannot "
+            "keep up and says so, so treat a 'dropped N events' line as a cue "
+            "to re-read the run over REST rather than as noise."
+        ),
+    )
+    watch.add_argument("run_id", help="Run to follow.")
+    watch.add_argument(
+        "--url",
+        default=os.environ.get("AWF_API_URL", "http://localhost:8000"),
+        help=(
+            "Server to watch (default: $AWF_API_URL, else "
+            "http://localhost:8000). http:// is upgraded to ws://."
+        ),
+    )
+    watch.add_argument(
+        "--token",
+        default=os.environ.get("AWF_API_TOKEN"),
+        help=(
+            "Bearer token for a server with api_auth_enabled (default: "
+            "$AWF_API_TOKEN). Prefer the environment: this value travels in the "
+            "URL query string and would otherwise be in your shell history."
+        ),
+    )
+    watch.add_argument(
+        "--max-frames",
+        type=int,
+        default=0,
+        help="Stop after this many frames (default: 0, follow until the run ends).",
+    )
+    watch.set_defaults(handler=_cmd_watch)
+
     return parser
 
 
@@ -821,7 +1062,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _echo("\ninterrupted", file=sys.stderr)
         return 130
     except Exception as exc:
-        if _os.environ.get("AWF_CLI_TRACE"):
+        if os.environ.get("AWF_CLI_TRACE"):
             raise
         # A traceback from a CLI buries the one line that matters. The class name
         # is kept because "WorkflowError: [concurrency_limit] ..." and

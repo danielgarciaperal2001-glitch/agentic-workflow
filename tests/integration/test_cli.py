@@ -280,6 +280,69 @@ class TestExitCodes:
         assert "Traceback (most recent call last)" in loud.stderr
 
 
+class TestWatch:
+    """``awf watch`` as a process: the argument wiring nothing else can see.
+
+    ``tests/integration/test_cli_watch.py`` drives the follower functions against
+    a real server and so proves they work. What it cannot prove is that argparse
+    accepts the flags, that the handler is attached, or that the exit code
+    survives ``main()`` — and this file already documents two bugs that were
+    invisible from inside the interpreter and would have been invisible here too
+    if the wiring had never been exercised as a command.
+    """
+
+    def test_the_command_is_listed_in_help(self) -> None:
+        """A feature nobody can find is a feature nobody has."""
+        result = run_cli("--help")
+        assert result.returncode == 0
+        assert "watch" in result.stdout
+
+    def test_it_reports_an_unreachable_server_as_bad_input(self) -> None:
+        """One line naming the address, and exit 2 rather than a traceback.
+
+        The port is bound and released so nothing is listening on it. ``--trace``
+        is the opt-in that restores the stack trace, and this asserts only on the
+        default.
+        """
+        result = run_cli("watch", "no-such-run", "--url", "http://127.0.0.1:9", "--max-frames", "1")
+        assert result.returncode == 2, result.stderr
+        assert "cannot reach" in result.stderr
+        assert "Traceback (most recent call last)" not in result.stderr
+
+    def test_the_url_comes_from_the_environment(self) -> None:
+        """``AWF_API_URL`` is the documented default and has to be honoured.
+
+        Hard-coding the default instead would leave the flag documented and
+        ignored — the same shape as the ``--log-level`` bug at the top of this
+        file, where a setting was accepted, listed in ``--help``, and never read.
+        """
+        result = run_cli(
+            "watch",
+            "no-such-run",
+            "--max-frames",
+            "1",
+            env=(("AWF_API_URL", "http://127.0.0.1:9"),),
+        )
+        assert result.returncode == 2, result.stderr
+        assert "127.0.0.1:9" in result.stderr, result.stderr
+
+    def test_a_token_from_the_environment_is_not_echoed(self) -> None:
+        """The credential must not reach stderr on the failure path."""
+        result = run_cli(
+            "watch",
+            "no-such-run",
+            "--max-frames",
+            "1",
+            env=(
+                ("AWF_API_URL", "http://127.0.0.1:9"),
+                ("AWF_API_TOKEN", "s3cret-token"),
+            ),
+        )
+        assert result.returncode == 2, result.stderr
+        assert "s3cret-token" not in result.stderr
+        assert "s3cret-token" not in result.stdout
+
+
 class TestTopology:
     """``awf topology`` is the documentation the docs cannot go stale on."""
 

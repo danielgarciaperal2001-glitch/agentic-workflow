@@ -59,10 +59,17 @@ postgres = [
   "psycopg[binary,pool]>=3.1",
 ]
 # HTTP + realtime transport for the control plane.
+#
+# `websockets` is a client dependency, not a server one: `awf watch` follows a
+# run over the wire. It arrives transitively via `uvicorn[standard]` and
+# `langgraph-sdk`, but importing a package that merely *happens* to be installed
+# is a dependency nobody declared, and it breaks the day either of those drops it
+# or their pins stop overlapping.
 api = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",
   "httpx>=0.27",
+  "websockets>=13.0",
 ]
 # Any OpenAI-compatible endpoint (OpenAI, Azure, vLLM, Ollama, LiteLLM, ...).
 llm = [

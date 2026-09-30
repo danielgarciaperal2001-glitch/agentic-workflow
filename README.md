@@ -358,6 +358,17 @@ awf replay <run_id> --index -1   # time travel: fork from any checkpoint
 awf topology               # nodes, edges, loops, routing table
 awf eval [--gate ...] [--json]  # score the golden dataset
 awf janitor [--dry-run]    # one checkpoint-retention pass
+awf watch <run_id>         # follow a run on a running server, as it happens
+```
+
+The first five run locally against their own engine and need no network and no
+credentials. `watch` is the exception: it is a client, and it needs a server to
+talk to.
+
+```bash
+awf watch pr-1042                                  # http://localhost:8000
+awf watch pr-1042 --url http://prod:8000           # somewhere else
+AWF_API_TOKEN=… awf watch pr-1042 --url wss://prod # auth via the environment
 ```
 
 Exit codes: `0` ok, `1` not done, `2` bad input, `130` interrupted. Set
