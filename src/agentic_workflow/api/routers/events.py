@@ -47,6 +47,7 @@ from starlette.websockets import WebSocketState
 from agentic_workflow.api.deps import websocket_auth
 from agentic_workflow.api.events import ANY_RUN, ConnectionLimitError, EventHub, Subscription
 from agentic_workflow.logging import get_logger
+from agentic_workflow.services.engine import TERMINAL_EVENT_BY_STATUS
 
 log = get_logger(__name__)
 
@@ -60,9 +61,14 @@ router = APIRouter(tags=["events"])
 #: from that run on that socket. A member of this set that the engine never emits
 #: is a socket that never closes; a status missing from it is one that hangs a
 #: subscriber forever. ``tests/api/test_runs_api.py`` pins the correspondence.
-TERMINAL_EVENTS: frozenset[str] = frozenset(
-    {"run.completed", "run.failed", "run.cancelled", "run.interrupted", "run.rejected"}
-)
+#:
+#: Derived from the engine's own status-to-event mapping rather than written out
+#: again, because the two had already drifted in spirit: this set was the place a
+#: new status had to be remembered, and forgetting is silent. Reading one mapping
+#: makes the set a consequence instead of a second thing to maintain. The test
+#: above still checks it against the persistence vocabulary independently, which
+#: is the check that would catch a mapping that is itself wrong.
+TERMINAL_EVENTS: frozenset[str] = frozenset(TERMINAL_EVENT_BY_STATUS.values())
 
 
 @router.websocket("/ws/runs/{run_id}")
@@ -162,7 +168,7 @@ async def _serve(websocket: WebSocket, run_id: str | None, token: str | None) ->
             send_timeout,
         )
         if run_id is not None:
-            await _send_snapshot(websocket, engine, run_id, send_timeout)
+            await _send_snapshot(websocket, sub, engine, run_id, send_timeout)
         await _pump(websocket, sub, heartbeat, send_timeout)
     except WebSocketDisconnect:
         pass
@@ -277,11 +283,31 @@ async def _send(websocket: WebSocket, payload: dict[str, Any], timeout: float) -
         raise WebSocketDisconnect(code=status.WS_1008_POLICY_VIOLATION) from exc
 
 
-async def _send_snapshot(websocket: WebSocket, engine: Any, run_id: str, timeout: float) -> None:
+async def _send_snapshot(
+    websocket: WebSocket,
+    sub: Subscription,
+    engine: Any,
+    run_id: str,
+    timeout: float,
+) -> None:
     """Send the run's current state as the first content frame.
+
+    If the run is already over, its ending event is queued as well. That is the
+    only way a late subscriber learns the outcome: the real terminal event was
+    published to the hub *before* this subscription existed, so it was delivered
+    to whoever was listening then and to no one now. Without the queue entry the
+    client holds the socket open on heartbeats indefinitely, against a snapshot
+    that says the run finished — a contradiction the client has no way to resolve.
+
+    The event goes through the queue rather than straight onto the socket so that
+    :func:`_pump` remains the only thing that decides when a stream ends. Sending
+    it directly would leave the pump with nothing to match and it would loop on
+    forever behind a frame the client had already received.
 
     Args:
         websocket: The live socket.
+        sub: This client's subscription, so a replayed ending is delivered the
+            same way a live one is.
         engine: The workflow engine.
         run_id: The run being observed.
         timeout: Bound on the send.
@@ -296,6 +322,23 @@ async def _send_snapshot(websocket: WebSocket, engine: Any, run_id: str, timeout
     if websocket.client_state is not WebSocketState.CONNECTED:  # pragma: no cover
         return
     await _send(websocket, {"event": "stream.snapshot", **outcome.to_dict()}, timeout)
+
+    ending = TERMINAL_EVENT_BY_STATUS.get(outcome.status)
+    if ending is None:
+        return
+    # A race is possible and harmless: a run finishing between the subscribe and
+    # this status read also put the real event in the queue, and the pump stops on
+    # whichever it dequeues first.
+    sub.put(
+        {
+            "event": ending,
+            "run_id": run_id,
+            "status": outcome.status,
+            "iteration": outcome.iteration,
+            "error": outcome.error,
+        }
+    )
+    log.info("ws.already_finished", run_id=run_id, status=outcome.status)
 
 
 __all__ = ["TERMINAL_EVENTS", "router", "stream_all", "stream_run"]

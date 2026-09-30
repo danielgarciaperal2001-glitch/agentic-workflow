@@ -202,6 +202,26 @@ It rides the `heartbeat` event name, so a client that ignores the field keeps
 working unchanged, and it arrives as soon as the loss happens rather than on the
 next idle tick — a client that fell behind is the one that never goes idle.
 
+**The stream opens with a snapshot and closes on the run's ending.** After
+`stream.open` you get one `stream.snapshot` carrying the run's state as of the
+moment you attached — status, iteration, the pending gate if there is one. That
+is what makes attaching late useful: a run parked on a human gate may not produce
+another event for hours, so without the snapshot the screen is empty until
+something happens.
+
+Then one of `run.completed`, `run.failed`, `run.cancelled`, `run.interrupted` or
+`run.rejected` arrives and the server closes the socket. **A run that finished
+before you attached still ends the stream**, on the event matching how it
+actually ended — you get `run.rejected`, not a generic "done". The real terminal
+event went to the hub before your subscription existed, so the server replays it
+from the snapshot's status; you observe a finished run exactly as you would have
+observed it live.
+
+A client that waits for a terminal event without watching the snapshot's status
+would previously wait forever on heartbeats against a snapshot saying the run was
+over. If you are writing your own client, do not rely on the socket closing to
+learn the outcome — read the status, and treat the closing event as confirmation.
+
 ## Correlating a run with the work that caused it
 
 `request_id` and `metadata` are the submitter's own fields, and they come back on

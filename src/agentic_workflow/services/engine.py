@@ -34,10 +34,11 @@ Example:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 import inspect
+from types import MappingProxyType
 from typing import Any, Final, cast, get_args
 
 from langchain_core.runnables import RunnableConfig
@@ -93,6 +94,27 @@ RUN_STATUSES: Final[frozenset[str]] = frozenset(get_args(RunStatus))
 #: Statuses that will not change again.
 FINAL_STATUSES: Final[frozenset[str]] = frozenset(
     {"completed", "failed", "cancelled", "interrupted", "rejected"}
+)
+
+#: The event a run in each final status ends on.
+#:
+#: Owned by the engine rather than by the socket layer because the engine is what
+#: publishes these names, and the socket layer is what has to agree with them: a
+#: subscriber filters on this set to decide when to stop waiting, and a client
+#: attaching after the fact is told the run's ending by name. Both consumers read
+#: this one mapping, so a status added on one side and not the other is a test
+#: failure rather than a connection that never closes.
+#:
+#: A status absent from this map ends on ``run.parked``: the run has stopped for
+#: now but will produce more events when someone answers it.
+TERMINAL_EVENT_BY_STATUS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "completed": "run.completed",
+        "failed": "run.failed",
+        "cancelled": "run.cancelled",
+        "interrupted": "run.interrupted",
+        "rejected": "run.rejected",
+    }
 )
 
 #: Terminal statuses the *graph* cannot report about itself, because the node
@@ -1755,13 +1777,7 @@ class WorkflowEngine:
 
     async def _emit_run_end(self, outcome: RunOutcome) -> None:
         """Publish the terminal (or parked) event for a run."""
-        event = {
-            "completed": "run.completed",
-            "failed": "run.failed",
-            "cancelled": "run.cancelled",
-            "interrupted": "run.interrupted",
-            "rejected": "run.rejected",
-        }.get(outcome.status, "run.parked")
+        event = TERMINAL_EVENT_BY_STATUS.get(outcome.status, "run.parked")
         await self._emit(
             event,
             run_id=outcome.run_id,

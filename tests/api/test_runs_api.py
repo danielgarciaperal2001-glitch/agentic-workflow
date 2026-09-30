@@ -942,6 +942,69 @@ class TestWebSocket:
         assert names[-1] in TERMINAL_EVENT_NAMES
         assert names.index("run.started") < len(names) - 1
 
+    def test_a_client_attaching_to_a_finished_run_is_told_it_finished(
+        self, fast_ws: TestClient, request_factory: Any
+    ) -> None:
+        """Attaching late must not leave a client waiting forever.
+
+        The test above pins that a terminal event closes the socket, and it
+        starts the run *after* the socket is open, so the event is published to
+        a subscriber that exists. The case it cannot reach is the ordinary one:
+        the run finishes, and somebody attaches afterwards. The terminal event
+        went to the hub before this subscriber was registered, so it is never
+        delivered, and the stream sends heartbeats indefinitely.
+
+        Measured against a real uvicorn server, attaching a second after the run
+        completed:
+
+            frames seen            stream.open, stream.snapshot, heartbeat, ...
+            snapshot status        'completed'
+            terminal event         none
+
+        So the snapshot says the run is over and the socket says it is waiting.
+        A client cannot tell those apart without inspecting run state itself,
+        which is the state the snapshot already handed it. The symptom is not a
+        crash: it is one connection per finished run, held open until whatever
+        sits on the other end gives up.
+        """
+        fast_ws.post("/v1/runs", json=_body(request_factory, "api-ws-late", auto_resolve=True))
+        finished = fast_ws.get("/v1/runs/api-ws-late").json()
+        assert finished["status"] == "completed", "the run really is over"
+
+        with fast_ws.websocket_connect("/ws/runs/api-ws-late") as socket:
+            frames = _read_until(socket, TERMINAL_EVENT_NAMES)
+
+        names = [frame["event"] for frame in frames]
+        assert names[-1] == "run.completed", (
+            f"a run that ended before the subscriber existed still ends the "
+            f"stream; got {names[-3:]}"
+        )
+
+    def test_attaching_late_to_a_failed_run_ends_the_stream_too(self, fast_ws: TestClient) -> None:
+        """The late-attach answer is the run's real ending, not a generic one.
+
+        A fix that closed the socket on any final status would leave the client
+        unable to tell a rejected run from a completed one, which is the whole
+        reason the event name carries the status.
+        """
+        fast_ws.post(
+            "/v1/runs",
+            json={
+                "run_id": "api-ws-late-fail",
+                "request_id": "PR-1042",
+                "title": "t",
+                "description": "d",
+                "auto_resolve": True,
+                "auto_decision": "reject",
+            },
+        )
+        assert fast_ws.get("/v1/runs/api-ws-late-fail").json()["status"] == "rejected"
+
+        with fast_ws.websocket_connect("/ws/runs/api-ws-late-fail") as socket:
+            frames = _read_until(socket, TERMINAL_EVENT_NAMES)
+
+        assert frames[-1]["event"] == "run.rejected"
+
     def test_per_node_progress_names_the_node(
         self, fast_ws: TestClient, request_factory: Any
     ) -> None:
