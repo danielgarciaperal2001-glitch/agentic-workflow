@@ -25,9 +25,6 @@ import structlog
 
 from agentic_workflow.config import LogFormat, Settings, load_settings
 
-# Context keys merged into every record emitted inside the block.
-CONTEXT_KEYS = ("run_id", "thread_id", "node", "agent", "event_id", "trace_id")
-
 _configured = False
 
 
