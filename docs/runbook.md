@@ -416,8 +416,10 @@ the token counts on `/metrics` are the process-wide total since boot — the
 number a budget dashboard wants, and the only number that can be reported
 honestly. They are exported as monotonic counters (`awf_llm_calls_total`,
 `awf_llm_prompt_tokens_total`, `awf_llm_completion_tokens_total`,
-`awf_llm_cached_tokens_total`); the same numbers appear in the JSON object the
-endpoint returns when it cannot render exposition text. A fresh process reads
+`awf_llm_cached_tokens_total`). `/metrics` always answers Prometheus exposition
+text and nothing else, whether or not `prometheus-client` happens to be
+installed — the renderer is hand-rolled, so its format is a property of this
+code and not of the environment. A fresh process reads
 all zeros: the client is built lazily, so empty really means "no calls yet".
 Note what the aggregate is *not*: per-run. The engine attributes LLM usage to
 each run at the source — it wraps the shared client per drive and records the

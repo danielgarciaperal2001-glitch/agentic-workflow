@@ -32,7 +32,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-import json
 from time import perf_counter
 from typing import Any, Final
 from uuid import uuid4
@@ -50,7 +49,6 @@ from agentic_workflow.api.events import EventHub
 from agentic_workflow.api.refusals import RefusalCounters
 from agentic_workflow.api.routers import approvals, events, health, runs, threads
 from agentic_workflow.config import Settings, load_settings
-from agentic_workflow.domain.schemas import utcnow
 from agentic_workflow.human.service import ApprovalService
 from agentic_workflow.llm.base import Usage
 from agentic_workflow.logging import bind_context, configure_logging, get_logger
@@ -294,23 +292,24 @@ def _meta_router() -> APIRouter:
     @router.get(
         "/metrics",
         include_in_schema=False,
-        summary="Operational counters (Prometheus text format when available)",
+        summary="Operational counters, in Prometheus exposition text",
     )
     async def metrics(request: Request) -> Response:
         """Return lightweight operational counters.
 
-        Emits Prometheus text if ``prometheus_client`` is installed and the
-        OpenMetrics exposition of the engine's own gauges is available;
-        otherwise returns a JSON object with the same numbers. The endpoint is
-        always present, because a metrics route that 404s takes down every
-        dashboard the moment an optional extra is missing.
+        Always Prometheus exposition text. The renderer is hand-rolled rather
+        than delegated to ``prometheus_client``, which is what makes the format a
+        property of this code instead of a property of what happens to be
+        installed: there is no optional dependency whose absence could change the
+        answer, and therefore nothing to degrade to. An endpoint that 404s — or
+        one that answered in a different shape depending on the deployment — takes
+        every dashboard down at once, which is a worse outage than a missing
+        counter.
         """
         engine = getattr(request.app.state, "engine", None)
         hub = getattr(request.app.state, "hub", None)
         refusals = getattr(request.app.state, "refusals", None)
         payload: dict[str, Any] = {
-            "ts": utcnow().isoformat(),
-            "version": __version__,
             "runs": len(engine.registry) if engine is not None else 0,
             "events": hub.stats() if hub is not None else {},
             # Process-wide LLM spend since boot: the engine's one client serves
@@ -344,7 +343,7 @@ _REFUSAL_COUNTER: Final[str] = "awf_refusals_total"
 
 
 def _render_metrics(payload: dict[str, Any]) -> Response:
-    """Render counters as Prometheus text, falling back to JSON.
+    """Render the counters as Prometheus exposition text.
 
     Event and run counters are gauges under a single ``awf_metric`` family;
     the process-wide LLM usage is exported as monotonic counters, which is the
@@ -353,13 +352,17 @@ def _render_metrics(payload: dict[str, Any]) -> Response:
     rather than joining ``awf_metric``, whose declared ``gauge`` type would
     invite a dashboard to read the running total as an instantaneous rate.
 
+    The payload carries exactly the keys this function reads. It used to carry
+    ``ts`` and ``version`` as well, for a JSON fallback guarded on ``flat`` being
+    empty — a guard the unconditional ``awf_runs_registered`` line above makes
+    impossible, so those two keys had no reader either and went with it.
+
     Args:
         payload: The counters collected from the engine and the hub.
 
     Returns:
         A :class:`~fastapi.responses.Response` in the exposition format the
-        metrics pipeline expects, or JSON when the counters cannot be expressed
-        as flat gauges.
+        metrics pipeline expects.
     """
     flat: dict[str, float] = {}
     counters: dict[str, Any] = payload.get("events") or {}
@@ -374,11 +377,6 @@ def _render_metrics(payload: dict[str, Any]) -> Response:
         if key in counters:
             flat[f"awf_events_{key}"] = float(counters[key])
     flat["awf_runs_registered"] = float(payload.get("runs", 0))
-    if not flat:
-        return Response(
-            content=json.dumps(payload, default=str),
-            media_type="application/json",
-        )
     usage: dict[str, Any] = payload.get("usage") or {}
     lines = [
         "# HELP awf_metric agentic-workflow operational counter.",
