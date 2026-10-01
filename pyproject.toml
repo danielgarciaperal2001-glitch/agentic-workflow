@@ -90,11 +90,6 @@ eval-deepeval = [
 ]
 # Observability, metrics and tracing.
 obs = [
-  "langsmith>=0.2",
-  "prometheus-client>=0.20",
-  "opentelemetry-api>=1.25",
-  "opentelemetry-instrumentation-fastapi>=0.46b0",
-  "opentelemetry-instrumentation-httpx>=0.46b0",
 ]
 # Developer experience.
 # Pulls in the extras the test suite actually imports. `tests/conftest.py`
