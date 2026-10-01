@@ -34,7 +34,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import json
 from time import perf_counter
-from typing import Any
+from typing import Any, Final
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, Request, Response
@@ -47,6 +47,7 @@ from agentic_workflow import __version__
 from agentic_workflow.api.deps import RateLimiter, rate_limited, require_auth
 from agentic_workflow.api.error_handlers import install_error_handlers
 from agentic_workflow.api.events import EventHub
+from agentic_workflow.api.refusals import RefusalCounters
 from agentic_workflow.api.routers import approvals, events, health, runs, threads
 from agentic_workflow.config import Settings, load_settings
 from agentic_workflow.domain.schemas import utcnow
@@ -166,6 +167,10 @@ def create_app(
         app.state.settings = resolved
         app.state.hub = hub
         app.state.rate_limiter = RateLimiter(resolved.api_rate_limit_per_minute)
+        # Counted here rather than derived from anything else, because the rate
+        # limiter, the concurrency ceiling and the token budget all answer 429
+        # and nothing else on the endpoint would ever move when one of them does.
+        app.state.refusals = RefusalCounters()
 
         owned = engine is None
         active = engine or WorkflowEngine(resolved)
@@ -302,6 +307,7 @@ def _meta_router() -> APIRouter:
         """
         engine = getattr(request.app.state, "engine", None)
         hub = getattr(request.app.state, "hub", None)
+        refusals = getattr(request.app.state, "refusals", None)
         payload: dict[str, Any] = {
             "ts": utcnow().isoformat(),
             "version": __version__,
@@ -310,6 +316,10 @@ def _meta_router() -> APIRouter:
             # Process-wide LLM spend since boot: the engine's one client serves
             # every run, so this is the total, not a per-run slice.
             "usage": (engine.llm_usage.as_dict() if engine is not None else Usage().as_dict()),
+            # What the server declined, by cause. Empty rather than zeroed: only
+            # reasons that actually refused are exported, so a dashboard shows no
+            # row for a ceiling that has not fired.
+            "refusals": refusals.snapshot() if refusals is not None else {},
         }
         return _render_metrics(payload)
 
@@ -326,13 +336,22 @@ _USAGE_COUNTERS: tuple[tuple[str, str], ...] = (
     ("cached_tokens", "awf_llm_cached_tokens_total"),
 )
 
+#: Refusals, labelled by the error code that produced them. One family for every
+#: ceiling, so a new 429 needs no edit here and an operator can still split the
+#: total by cause instead of summing across a busy server and an overspending
+#: client.
+_REFUSAL_COUNTER: Final[str] = "awf_refusals_total"
+
 
 def _render_metrics(payload: dict[str, Any]) -> Response:
     """Render counters as Prometheus text, falling back to JSON.
 
     Event and run counters are gauges under a single ``awf_metric`` family;
     the process-wide LLM usage is exported as monotonic counters, which is the
-    semantics a budget dashboard expects of token spend.
+    semantics a budget dashboard expects of token spend. Refusals are monotonic
+    too, so they are counters as well — and they keep their own labelled family
+    rather than joining ``awf_metric``, whose declared ``gauge`` type would
+    invite a dashboard to read the running total as an instantaneous rate.
 
     Args:
         payload: The counters collected from the engine and the hub.
@@ -369,6 +388,16 @@ def _render_metrics(payload: dict[str, Any]) -> Response:
     for key, name in _USAGE_COUNTERS:
         lines.append(f"# TYPE {name} counter")
         lines.append(f"{name} {int(usage.get(key, 0)):g}")
+    # Sorted so a scrape is byte-stable, which is what makes two diffs of the
+    # endpoint comparable; a dict's insertion order would only track which
+    # ceiling happened to fire first.
+    refusals: dict[str, int] = payload.get("refusals") or {}
+    if refusals:
+        lines.append(f"# TYPE {_REFUSAL_COUNTER} counter")
+        lines.extend(
+            f'{_REFUSAL_COUNTER}{{reason="{reason}"}} {refusals[reason]:g}'
+            for reason in sorted(refusals)
+        )
     lines.append("")
     return Response(content="\n".join(lines), media_type="text/plain; version=0.0.4; charset=utf-8")
 

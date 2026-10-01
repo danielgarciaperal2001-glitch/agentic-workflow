@@ -440,6 +440,42 @@ and the operation payloads themselves carry the spend — `POST /v1/runs` shows
 the whole run when `auto_resolve` is set, or that drive's share when it
 parks.
 
+### Refusals
+
+```bash
+curl -s localhost:8000/metrics | grep awf_refusals
+```
+
+Three ceilings answer `429`, and none of them moves anything else on the
+endpoint — so a plane that is turning work away looks identical to a quiet one.
+`awf_refusals_total` counts them, labelled by the error code that produced each:
+
+```text
+# TYPE awf_refusals_total counter
+awf_refusals_total{reason="rate_limited"} 12
+awf_refusals_total{reason="token_budget_exceeded"} 1
+```
+
+| reason | ceiling | where it is set |
+| --- | --- | --- |
+| `rate_limited` | requests per minute per client | `api_rate_limit_per_minute` |
+| `concurrency_limit` | runs in flight | `max_parallel_runs` |
+| `token_budget_exceeded` | tokens one run may spend | `llm_token_budget_per_run` |
+| `provider_rate_limited` | upstream provider throttling us | the provider, not us |
+
+They are monotonic counters, not gauges: a refusal that happened cannot
+un-happen. They are also their own family rather than entries in `awf_metric`,
+which is declared `gauge`, so nothing sums a running total as if it were a rate.
+
+Two things to read carefully. The series exists **only for reasons that have
+actually fired** — no refusals means no `awf_refusals_total` line at all, not a
+row of zeros. And `provider_rate_limited` is the one label whose cause is
+upstream: it means our provider quota is exhausted, not that a client misbehaved.
+A growing `rate_limited` says one caller is too aggressive; a growing
+`token_budget_exceeded` says a client is submitting reviews too expensive to
+review; a growing `provider_rate_limited` says we are the problem. The totals
+restart with the process, like the token counters above.
+
 ## Verifying a change did not break quality
 
 ```bash

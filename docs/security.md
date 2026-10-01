@@ -132,7 +132,7 @@ Each of these is a claim about a deployment, not an omission:
 | --- | --- | --- |
 | `/health/live`, `/health/ready` | An orchestrator, a load balancer and a `docker healthcheck` cannot hold a token. A probe that needs credentials fails when they rotate, and reports the application unhealthy when it is not. | Readiness names its dependencies and counts pending approvals. Nothing else. |
 | `/` | A pointer at the API. Refusing it makes an unauthenticated `curl` look like an outage. | The service name, its version, and the endpoint list. |
-| `/metrics` | Prometheus authenticates by network, not by header. | The number of runs in memory, event counters (published, delivered, dropped, subscribers, runs observed) and process-wide token spend. Keep it on an internal network. |
+| `/metrics` | Prometheus authenticates by network, not by header. | The number of runs in memory, event counters (published, delivered, dropped, subscribers, runs observed), process-wide token spend, and refusal counters labelled by cause (`rate_limited`, `concurrency_limit`, `token_budget_exceeded`, `provider_rate_limited`). The refusal labels name which ceiling a caller hit, so the endpoint says how a client is being shaped — keep it on an internal network. |
 | `/docs`, `/redoc`, `/openapi.json` | They exist only when `environment` is not `production`. | A complete map of the control plane. |
 | `/ws/runs/{id}`, `/ws/events` | Not exempt: a socket authenticates in the handshake, in the query string, and is refused with a 403 before any data flows. `tests/api/test_ws_auth.py`. | The token is in a URL. |
 

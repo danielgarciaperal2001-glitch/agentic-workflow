@@ -28,6 +28,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from agentic_workflow.api.refusals import record_refusal
 from agentic_workflow.errors import ErrorCode, WorkflowError
 from agentic_workflow.logging import get_logger
 
@@ -135,8 +136,22 @@ def error_response(
     Returns:
         A :class:`~fastapi.responses.JSONResponse` carrying the envelope and, for
         failures, a ``Retry-After`` hint when the code is retryable.
+
+    Side Effects:
+        A ``429`` is counted against the serving application's
+        :class:`~agentic_workflow.api.refusals.RefusalCounters`, which is what
+        publishes ``awf_refusals_total`` on ``/metrics``. Rendering is otherwise
+        side-effect free.
     """
     status_code = http_status if http_status is not None else status_for(exc.code)
+    if status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+        # Every ceiling the server has is answered here, from three layers below
+        # the transport, so this is the one place a refusal can be counted once
+        # instead of at each `raise` — and a ceiling added tomorrow is covered by
+        # the fact that it answers 429. The status is the test rather than the
+        # code, because the status is what the client was actually told; an error
+        # that is not a refusal (a 404, a 409) is a failure and stays uncounted.
+        record_refusal(request, exc.code.value)
     body = {
         "error": exc.to_dict(),
         "request_id": getattr(request.state, "request_id", None),
@@ -215,6 +230,10 @@ def install_error_handlers(app: FastAPI) -> None:
         detail: Any = exc.detail
         if isinstance(detail, dict) and "error" in detail:
             # Already enveloped (e.g. by a router raising 404 deliberately).
+            # Deliberately not counted as a refusal: nothing in the tree raises a
+            # pre-enveloped 429, and a future one would have to route through
+            # error_response to be counted. Add it there rather than here, or the
+            # refusal silently never reaches `awf_refusals_total`.
             return JSONResponse(status_code=exc.status_code, content=detail, headers=exc.headers)
         code = {
             401: ErrorCode.AUTHENTICATION_ERROR,
