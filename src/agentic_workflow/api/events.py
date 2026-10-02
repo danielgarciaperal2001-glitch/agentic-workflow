@@ -279,9 +279,22 @@ class EventHub:
         try:
             run_id = str(event.get("run_id") or "")
             payload = {**event, "seq": self._published}
-            targets: list[Subscription] = list(self._subscribers.get(ANY_RUN, ()))
-            if run_id:
+            targets: list[Subscription] = []
+            wildcard = self._subscribers.get(ANY_RUN, ())
+            if wildcard:
+                targets.extend(wildcard)
+            if run_id and run_id != ANY_RUN:
                 targets.extend(self._subscribers.get(run_id, ()))
+            # Broadcast to the global bucket when present. A global subscriber wants
+            # every event the hub emits, regardless of whether it has a run_id.
+            global_bucket = self._subscribers.get("*", ())
+            # Do NOT extend if the same bucket object is already in targets.
+            # '*' is a different bucket from ANY_RUN by design; we only add it when
+            # it's a distinct set of subscribers.
+            if global_bucket is not wildcard and global_bucket is not (
+                self._subscribers.get(run_id, ()) if (run_id and run_id != ANY_RUN) else None
+            ):
+                targets.extend(global_bucket)
 
             delivered = 0
             for sub in targets:
@@ -374,6 +387,19 @@ class EventHub:
                 if not bucket:
                     del self._subscribers[sub.run_id]
         log.info("hub.unsubscribed", run_id=sub.run_id, dropped=sub.dropped)
+
+    async def subscribe_all(self) -> Subscription:
+        """Register a global subscriber for every event the hub emits.
+
+        Returns:
+            A subscription whose ``run_id`` is ``ANY_RUN`` but which is treated
+            as a broadcast bucket so every published event reaches it.
+        """
+        return await self.subscribe(ANY_RUN)
+
+    async def subscribe_global(self) -> Subscription:
+        """Alias for :meth:`subscribe_all`, to match naming used elsewhere."""
+        return await self.subscribe_all()
 
     async def close(self) -> None:
         """Drop every subscriber. Used on shutdown."""

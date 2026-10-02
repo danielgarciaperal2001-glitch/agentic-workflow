@@ -47,7 +47,7 @@ from agentic_workflow.api.deps import RateLimiter, rate_limited, require_auth
 from agentic_workflow.api.error_handlers import install_error_handlers
 from agentic_workflow.api.events import EventHub
 from agentic_workflow.api.refusals import RefusalCounters
-from agentic_workflow.api.routers import approvals, events, health, runs, threads
+from agentic_workflow.api.routers import approvals, dashboard, events, health, runs, threads
 from agentic_workflow.config import Settings, load_settings
 from agentic_workflow.human.service import ApprovalService
 from agentic_workflow.llm.base import Usage
@@ -254,6 +254,7 @@ def create_app(
     app.include_router(approvals.router, dependencies=secured)
     app.include_router(threads.router, dependencies=secured)
     app.include_router(events.router)
+    app.include_router(dashboard.router)
     app.include_router(_meta_router())
 
     log.info("api.created", version=__version__, environment=resolved.environment.value)

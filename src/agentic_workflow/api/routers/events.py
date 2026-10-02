@@ -93,21 +93,31 @@ async def stream_run(
     await _serve(websocket, None if run_id == ANY_RUN else run_id, token)
 
 
-@router.websocket("/ws/events")
-async def stream_all(
+@router.websocket("/ws/stream")
+async def stream_global(
     websocket: WebSocket,
     token: str | None = Query(default=None, description="Bearer token, for browsers."),
 ) -> None:
-    """Stream every run's events on one socket.
+    """Stream every event the hub emits, regardless of which run it belongs to.
 
-    Intended for dashboards. This is a firehose — a busy deployment emits events
-    from every run — so a UI should filter client-side.
-
-    Args:
-        websocket: The inbound socket.
-        token: Bearer token, required when ``api_auth_enabled`` is set.
+    This is the global firehose the read-only dashboard connects to. The
+    subscription is broadcast-only: no run-specific snapshot is sent, and no
+    terminal condition closes it, so the stream stays open as long as the client
+    holds the socket.
     """
-    await _serve(websocket, None, token)
+    await _serve(websocket, "*", token)
+
+
+@router.websocket("/ws/events")
+async def stream_events(
+    websocket: WebSocket,
+    token: str | None = Query(default=None, description="Bearer token, for browsers."),
+) -> None:
+    """Backward-compatible alias for :func:`stream_global`.
+
+    Kept for existing clients and tests that connect to ``/ws/events``.
+    """
+    await _serve(websocket, "*", token)
 
 
 # --------------------------------------------------------------------------- #
@@ -167,7 +177,7 @@ async def _serve(websocket: WebSocket, run_id: str | None, token: str | None) ->
             },
             send_timeout,
         )
-        if run_id is not None:
+        if run_id is not None and run_id != ANY_RUN:
             await _send_snapshot(websocket, sub, engine, run_id, send_timeout)
         await _pump(websocket, sub, heartbeat, send_timeout)
     except WebSocketDisconnect:
@@ -346,4 +356,4 @@ async def _send_snapshot(
     log.info("ws.already_finished", run_id=run_id, status=outcome.status)
 
 
-__all__ = ["TERMINAL_EVENTS", "router", "stream_all", "stream_run"]
+__all__ = ["TERMINAL_EVENTS", "router", "stream_events", "stream_global", "stream_run"]
